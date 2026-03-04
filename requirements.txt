@@ -4,7 +4,7 @@ fastapi
 uvicorn
 pandas
 openpyxl
+xlsxwriter
 pillow
 opencv-python
 pyyaml
-openpyxl

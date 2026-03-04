@@ -18,12 +18,14 @@ class ValidateRequest(BaseModel):
 class PredictRequest(BaseModel):
     dataset_path: str
     conf: float = 0.25
+    iou_thresh: float = 0.5
 
 
 class BothRequest(BaseModel):
     dataset_path: str
     conf: float = 0.25
     iou: float = 0.45
+    iou_thresh: float = 0.5
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -41,12 +43,18 @@ def validate(req: ValidateRequest):
 def predict(req: PredictRequest):
     if state.evaluator.model is None:
         raise HTTPException(400, "Model not loaded. Call /api/model/load first.")
-    results = state.evaluator.run_predict(req.dataset_path, req.conf)
-    state.last_predict_results = results
+    results, raw_data, has_gt = state.evaluator.run_predict_with_gt(
+        req.dataset_path, req.conf, req.iou_thresh
+    )
+    state.last_predict_results   = results
+    state.last_raw_data          = raw_data
+    state.has_gt                 = has_gt
+    state.last_threshold_results = []   # invalidate cache
     return {
-        "total_images": len(results),
+        "total_images":     len(results),
         "total_detections": sum(r["total_detections"] for r in results),
-        "results": results,
+        "has_gt":           has_gt,
+        "results":          results,
     }
 
 
@@ -56,14 +64,22 @@ def both(req: BothRequest):
         raise HTTPException(400, "Model not loaded. Call /api/model/load first.")
     val_metrics = state.evaluator.run_validation(req.dataset_path, req.conf, req.iou)
     state.last_val_metrics = val_metrics
-    predict_results = state.evaluator.run_predict(req.dataset_path, req.conf)
-    state.last_predict_results = predict_results
+
+    results, raw_data, has_gt = state.evaluator.run_predict_with_gt(
+        req.dataset_path, req.conf, req.iou_thresh
+    )
+    state.last_predict_results   = results
+    state.last_raw_data          = raw_data
+    state.has_gt                 = has_gt
+    state.last_threshold_results = []   # invalidate cache
+
     return {
         "val_metrics": val_metrics,
         "predict": {
-            "total_images": len(predict_results),
-            "total_detections": sum(r["total_detections"] for r in predict_results),
-            "results": predict_results,
+            "total_images":     len(results),
+            "total_detections": sum(r["total_detections"] for r in results),
+            "has_gt":           has_gt,
+            "results":          results,
         },
     }
 
@@ -85,6 +101,38 @@ def get_annotated_image(image_name: str):
 
     pil_img = state.evaluator.get_annotated_image(
         result["image_path"], result["detections"]
+    )
+    if pil_img is None:
+        raise HTTPException(500, f"Could not read image file: {result['image_path']}")
+
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/jpeg")
+
+
+@router.get("/image/comparison")
+def get_comparison_image(image_name: str):
+    """
+    Return GT-vs-prediction comparison image (JPEG).
+    Green = matched GT, Lime dashed = TP pred, Red = FP, Orange = FN (missed GT).
+    Only available when GT labels exist.
+    """
+    if not state.has_gt:
+        raise HTTPException(400, "No GT labels found for this dataset.")
+
+    result = next(
+        (r for r in state.last_predict_results if r["image_name"] == image_name),
+        None,
+    )
+    if result is None:
+        raise HTTPException(404, f"'{image_name}' not found in last predict results.")
+
+    pil_img = state.evaluator.get_comparison_image(
+        result["image_path"],
+        result["tp_pairs"],
+        result["fp_preds"],
+        result["fn_gts"],
     )
     if pil_img is None:
         raise HTTPException(500, f"Could not read image file: {result['image_path']}")
