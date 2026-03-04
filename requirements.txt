@@ -1,0 +1,10 @@
+ultralytics
+gradio>=4.0
+fastapi
+uvicorn
+pandas
+openpyxl
+pillow
+opencv-python
+pyyaml
+openpyxl
