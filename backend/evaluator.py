@@ -491,8 +491,8 @@ class ModelEvaluator:
         if img is None:
             return None
         h, w = img.shape[:2]
-        font_scale = max(0.4, min(w, h) / 1000)
-        thick = max(1, int(min(w, h) / 500))
+        font_scale = max(0.4, min(w, h) / 1500)
+        thick = max(1, int(min(w, h) / 1000))
 
         def _box(det, color, label_text, dash=False):
             x1 = max(0, int(det["x1"])); y1 = max(0, int(det["y1"]))
@@ -542,8 +542,8 @@ class ModelEvaluator:
             return None
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
-        font_scale = max(0.4, min(w, h) / 1000)
-        thickness  = max(1, int(min(w, h) / 500))
+        font_scale = max(0.4, min(w, h) / 1500)
+        thickness  = max(1, int(min(w, h) / 1000))
 
         for det in detections:
             cls_id = det["class_id"]
