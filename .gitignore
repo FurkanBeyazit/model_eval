@@ -115,3 +115,4 @@ frontend/*.pyc
 #data
 data/
 draw.py
+*.zip

@@ -164,13 +164,25 @@ def list_images():
 
 
 @router.get("/image/annotated")
-def get_annotated_image(image_name: str):
+def get_annotated_image(
+    image_name: str,
+    classes: str = "",          # comma-separated class names to show; empty = all
+    highlight_idx: int = -1,    # index within the (filtered) detection list to highlight
+):
     result = next(
         (r for r in state.last_predict_results if r["image_name"] == image_name), None
     )
     if result is None:
         raise HTTPException(404, f"'{image_name}' not found in last predict results.")
-    pil_img = state.evaluator.get_annotated_image(result["image_path"], result["detections"])
+
+    dets = result["detections"]
+    if classes:
+        filter_set = {c.strip() for c in classes.split(",") if c.strip()}
+        dets = [d for d in dets if d["class_name"] in filter_set]
+
+    pil_img = state.evaluator.get_annotated_image(
+        result["image_path"], dets, highlight_idx=highlight_idx
+    )
     if pil_img is None:
         raise HTTPException(500, f"Could not read image file: {result['image_path']}")
     buf = io.BytesIO()

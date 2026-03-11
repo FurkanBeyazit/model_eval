@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from routers import model, analysis, export
+from routers import model, analysis, export, upload
 
 app = FastAPI(
     title="Model Eval Platform API",
@@ -33,6 +33,7 @@ app.add_middleware(
 app.include_router(model.router)
 app.include_router(analysis.router)
 app.include_router(export.router)
+app.include_router(upload.router)
 
 
 @app.get("/health", tags=["health"])

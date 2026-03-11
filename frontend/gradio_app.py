@@ -1,6 +1,5 @@
 """
-gradio_app.py  –  Model Eval Platform — Gradio Frontend
-Communicates exclusively with the FastAPI backend via REST.
+gradio_app.py  –  Danusys Model Eval Platform — Gradio Frontend
 """
 
 import os
@@ -37,6 +36,69 @@ def _check_backend() -> bool:
         return _get("/health").status_code == 200
     except Exception:
         return False
+
+
+def _fetch_annotated(image_name: str, classes: str = "", highlight_idx: int = -1):
+    """Fetch annotated JPEG from backend, returns PIL Image or None."""
+    try:
+        resp = requests.get(
+            f"{API_BASE}/api/analysis/image/annotated",
+            params={"image_name": image_name, "classes": classes,
+                    "highlight_idx": highlight_idx},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content))
+    except Exception:
+        return None
+
+
+def _build_det_df(dets: list) -> pd.DataFrame:
+    if not dets:
+        return pd.DataFrame(columns=["#", "Class", "Conf", "X1", "Y1", "X2", "Y2", "W", "H"])
+    return pd.DataFrame([
+        {"#": i, "Class": d["class_name"], "Conf": d["confidence"],
+         "X1": int(d["x1"]), "Y1": int(d["y1"]),
+         "X2": int(d["x2"]), "Y2": int(d["y2"]),
+         "W": int(d["x2"] - d["x1"]), "H": int(d["y2"] - d["y1"])}
+        for i, d in enumerate(dets)
+    ])
+
+
+# ── Upload callbacks ──────────────────────────────────────────────────────────
+
+def _file_path(file_obj) -> str:
+    """Normalize Gradio file object → local path string."""
+    if file_obj is None:
+        return ""
+    if isinstance(file_obj, str):
+        return file_obj
+    if isinstance(file_obj, dict):
+        return file_obj.get("name", "")
+    return getattr(file_obj, "name", str(file_obj))
+
+
+def model_upload_cb(file_obj):
+    """User uploaded a .pt file — its Gradio temp path is directly usable by backend."""
+    return _file_path(file_obj)
+
+
+def dataset_zip_upload_cb(file_obj):
+    """User uploaded a dataset .zip — backend extracts it and returns the folder path."""
+    path = _file_path(file_obj)
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(
+                f"{API_BASE}/api/upload/dataset",
+                files={"file": (os.path.basename(path), f, "application/zip")},
+                timeout=300,
+            )
+        resp.raise_for_status()
+        return resp.json()["dataset_path"]
+    except Exception as exc:
+        return f"Upload error: {exc}"
 
 
 # ── Browse dialogs ────────────────────────────────────────────────────────────
@@ -81,25 +143,6 @@ def _per_image_df(results: list, has_gt: bool = False) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _stats_df(results: list) -> pd.DataFrame:
-    if not results:
-        return pd.DataFrame()
-    all_classes = sorted({det["class_name"] for r in results for det in r["detections"]})
-    rows = []
-    for cls in all_classes:
-        confs = [det["confidence"] for r in results for det in r["detections"]
-                 if det["class_name"] == cls]
-        rows.append({
-            "Class":          cls,
-            "Total Det.":     len(confs),
-            "Images w/ Det.": sum(1 for r in results if cls in r["class_counts"]),
-            "Avg Conf":       round(sum(confs) / len(confs), 3) if confs else 0,
-            "Min Conf":       round(min(confs), 3) if confs else 0,
-            "Max Conf":       round(max(confs), 3) if confs else 0,
-        })
-    return pd.DataFrame(rows)
-
-
 def _worst_images_df(results: list, has_gt: bool = False) -> pd.DataFrame:
     if not results:
         return pd.DataFrame()
@@ -126,6 +169,19 @@ def _worst_images_df(results: list, has_gt: bool = False) -> pd.DataFrame:
     return df.head(20).reset_index(drop=True)
 
 
+def _val_combined_df(val_data: dict) -> pd.DataFrame:
+    mp = val_data.get("mp", 0)
+    mr = val_data.get("mr", 0)
+    f1_all = round(2 * mp * mr / (mp + mr), 4) if (mp + mr) > 0 else 0
+    rows = [{"Class": "all", "Precision": mp, "Recall": mr, "F1": f1_all,
+             "mAP50": val_data.get("map50", ""), "mAP50-95": val_data.get("map50_95", "")}]
+    for m in val_data.get("class_metrics", []):
+        rows.append({"Class": m["class"], "Precision": m["Precision"],
+                     "Recall": m["Recall"], "F1": m["F1"],
+                     "mAP50": m["mAP50"], "mAP50-95": m["mAP50-95"]})
+    return pd.DataFrame(rows)
+
+
 def _history_df() -> pd.DataFrame:
     try:
         data = _get("/api/analysis/history").json()
@@ -135,11 +191,11 @@ def _history_df() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ── Callbacks ─────────────────────────────────────────────────────────────────
+# ── Model callbacks ───────────────────────────────────────────────────────────
 
 def load_model_cb(model_path: str):
     if not model_path or not model_path.strip():
-        return "Model path is empty.", ""
+        return "No path specified.", ""
     try:
         data = _post("/api/model/load", {"model_path": model_path})
         if data["ok"]:
@@ -147,28 +203,23 @@ def load_model_cb(model_path: str):
                 f"  [{k}] {v}"
                 for k, v in sorted(data["classes"].items(), key=lambda x: int(x[0]))
             )
-            return f"Loaded: {data['message']}", classes_lines
-        return f"Error: {data['message']}", ""
+            return "✓  Model Ready", classes_lines
+        return f"✗  {data['message']}", ""
     except Exception as exc:
-        return f"Backend error: {exc}", ""
+        return f"✗  Backend error: {exc}", ""
 
+
+# ── Run callbacks ─────────────────────────────────────────────────────────────
 
 def run_val_cb(dataset_path: str, conf: float, iou: float):
     if not _check_backend():
-        return "Backend not running — start backend/main.py first.", {}, None, None
+        return "Backend not running — start backend/main.py first.", {}, None
     try:
         data = _post("/api/analysis/validate",
                      {"dataset_path": dataset_path, "conf": conf, "iou": iou})
-        df_summary = pd.DataFrame([
-            {"Metric": "mAP50",         "Value": data["map50"]},
-            {"Metric": "mAP50-95",      "Value": data["map50_95"]},
-            {"Metric": "Mean Precision", "Value": data["mp"]},
-            {"Metric": "Mean Recall",    "Value": data["mr"]},
-        ])
-        df_class = pd.DataFrame(data.get("class_metrics", []))
-        return "Validation complete.", data, df_summary, df_class
+        return "Validation complete.", data, _val_combined_df(data)
     except Exception as exc:
-        return f"Error: {exc}", {}, None, None
+        return f"Error: {exc}", {}, None
 
 
 def run_predict_cb(dataset_path: str, conf: float, iou_thresh: float):
@@ -177,17 +228,16 @@ def run_predict_cb(dataset_path: str, conf: float, iou_thresh: float):
     try:
         data = _post("/api/analysis/predict",
                      {"dataset_path": dataset_path, "conf": conf, "iou_thresh": iou_thresh})
-        results  = data["results"]
-        has_gt   = data.get("has_gt", False)
-        df       = _per_image_df(results, has_gt)
-        names    = [r["image_name"] for r in results]
-        worst_df = _worst_images_df(results, has_gt)
-        gt_note  = " | GT labels found ✓" if has_gt else " | No GT labels"
+        results = data["results"]
+        has_gt  = data.get("has_gt", False)
+        names   = [r["image_name"] for r in results]
+        gt_note = " | GT labels found ✓" if has_gt else " | No GT labels"
         return (
             f"{data['total_images']} images | {data['total_detections']} detections{gt_note}",
-            results, has_gt, df,
+            results, has_gt,
+            _per_image_df(results, has_gt),
             gr.update(choices=names, value=names[0] if names else None),
-            worst_df,
+            _worst_images_df(results, has_gt),
         )
     except Exception as exc:
         return f"Error: {exc}", [], False, None, gr.update(choices=[], value=None), None
@@ -196,7 +246,7 @@ def run_predict_cb(dataset_path: str, conf: float, iou_thresh: float):
 def run_both_cb(dataset_path: str, conf: float, iou: float, iou_thresh: float):
     if not _check_backend():
         empty = gr.update(choices=[], value=None)
-        return "Backend not running.", {}, None, None, [], False, None, empty, None
+        return "Backend not running.", {}, None, [], False, None, empty, None
     try:
         data = _post("/api/analysis/both", {
             "dataset_path": dataset_path, "conf": conf,
@@ -206,50 +256,62 @@ def run_both_cb(dataset_path: str, conf: float, iou: float, iou_thresh: float):
         pred    = data["predict"]
         results = pred["results"]
         has_gt  = pred.get("has_gt", False)
-        df_summary = pd.DataFrame([
-            {"Metric": "mAP50",         "Value": val["map50"]},
-            {"Metric": "mAP50-95",      "Value": val["map50_95"]},
-            {"Metric": "Mean Precision", "Value": val["mp"]},
-            {"Metric": "Mean Recall",    "Value": val["mr"]},
-        ])
-        df_class   = pd.DataFrame(val.get("class_metrics", []))
-        df_per_img = _per_image_df(results, has_gt)
-        worst_df   = _worst_images_df(results, has_gt)
-        names = [r["image_name"] for r in results]
+        names   = [r["image_name"] for r in results]
         gt_note = " | GT labels found ✓" if has_gt else " | No GT labels"
-        status = (f"Val mAP50={val['map50']} | "
-                  f"Predict: {pred['total_images']} images, "
-                  f"{pred['total_detections']} detections{gt_note}")
+        status  = (f"Val mAP50={val['map50']} | "
+                   f"Predict: {pred['total_images']} images, "
+                   f"{pred['total_detections']} detections{gt_note}")
         return (
             status,
-            val, df_summary, df_class,
-            results, has_gt, df_per_img,
+            val,
+            _val_combined_df(val),
+            results, has_gt,
+            _per_image_df(results, has_gt),
             gr.update(choices=names, value=names[0] if names else None),
-            worst_df,
+            _worst_images_df(results, has_gt),
         )
     except Exception as exc:
         empty = gr.update(choices=[], value=None)
-        return f"Error: {exc}", {}, None, None, [], False, None, empty, None
+        return f"Error: {exc}", {}, None, [], False, None, empty, None
 
 
-def view_image_cb(image_name: str, predict_state: list):
+# ── Image viewer callbacks ────────────────────────────────────────────────────
+
+def image_load_cb(image_name: str, predict_state: list):
+    """Called when a new image is selected — resets class filter, shows all detections."""
+    if not image_name or not predict_state:
+        return None, pd.DataFrame(), gr.update(choices=[], value=[])
+    result = next((r for r in predict_state if r["image_name"] == image_name), None)
+    if not result:
+        return None, pd.DataFrame(), gr.update(choices=[], value=[])
+    all_classes = sorted(set(d["class_name"] for d in result["detections"]))
+    pil_img     = _fetch_annotated(image_name)
+    det_df      = _build_det_df(result["detections"])
+    return pil_img, det_df, gr.update(choices=all_classes, value=[])
+
+
+def image_filter_cb(image_name: str, predict_state: list, class_filter: list):
+    """Called when class filter changes — keeps same image, applies filter."""
     if not image_name or not predict_state:
         return None, pd.DataFrame()
-    pil_img = None
-    try:
-        resp    = _get("/api/analysis/image/annotated", {"image_name": image_name})
-        pil_img = Image.open(io.BytesIO(resp.content))
-    except Exception:
-        pass
     result = next((r for r in predict_state if r["image_name"] == image_name), None)
-    if result is None or not result["detections"]:
-        return pil_img, pd.DataFrame(columns=["Class", "Conf", "X1", "Y1", "X2", "Y2"])
-    df = pd.DataFrame([
-        {"Class": d["class_name"], "Conf": d["confidence"],
-         "X1": d["x1"], "Y1": d["y1"], "X2": d["x2"], "Y2": d["y2"]}
-        for d in result["detections"]
-    ])
-    return pil_img, df
+    if not result:
+        return None, pd.DataFrame()
+    classes_param = ",".join(class_filter) if class_filter else ""
+    pil_img = _fetch_annotated(image_name, classes=classes_param)
+    dets    = [d for d in result["detections"]
+               if not class_filter or d["class_name"] in class_filter]
+    return pil_img, _build_det_df(dets)
+
+
+def on_det_select(evt: gr.SelectData, image_name: str, predict_state: list,
+                  class_filter: list):
+    """Highlight the clicked detection row on the image."""
+    if not image_name or not predict_state:
+        return None
+    row_idx = evt.index[0]
+    classes_param = ",".join(class_filter) if class_filter else ""
+    return _fetch_annotated(image_name, classes=classes_param, highlight_idx=row_idx)
 
 
 def view_comparison_cb(image_name: str, predict_state: list, has_gt: bool):
@@ -267,14 +329,18 @@ def view_comparison_cb(image_name: str, predict_state: list, has_gt: bool):
     rows = []
     for pair in result.get("tp_pairs", []):
         rows.append({"Type": "TP", "Class": pair["pred"]["class_name"],
-                     "Conf": pair["pred"]["confidence"], "IoU": pair["iou"]})
+                     "Conf": round(pair["pred"]["confidence"], 3),
+                     "IoU": round(pair["iou"], 3)})
     for p in result.get("fp_preds", []):
-        rows.append({"Type": "FP", "Class": p["class_name"], "Conf": p["confidence"], "IoU": ""})
+        rows.append({"Type": "FP", "Class": p["class_name"],
+                     "Conf": round(p["confidence"], 3), "IoU": ""})
     for g in result.get("fn_gts", []):
-        rows.append({"Type": "FN (Miss)", "Class": g["class_name"], "Conf": "", "IoU": ""})
+        rows.append({"Type": "FN", "Class": g["class_name"], "Conf": "", "IoU": ""})
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Type", "Class", "Conf", "IoU"])
     return pil_img, df
 
+
+# ── Export / history ──────────────────────────────────────────────────────────
 
 def export_cb():
     try:
@@ -299,13 +365,16 @@ def clear_history_cb():
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
 THEME = gr.themes.Soft(primary_hue="blue", secondary_hue="slate", neutral_hue="slate")
-CSS   = "footer { display: none !important; }"
+CSS   = """
+footer { display: none !important; }
+.model-status textarea { font-size: 1.1em; font-weight: bold; }
+"""
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="Model Eval Platform", css=CSS, theme=THEME) as demo:
+    with gr.Blocks(title="Danusys Model Eval Platform", css=CSS, theme=THEME) as demo:
 
-        gr.Markdown("# Model Eval Platform\nYOLO fine-tuned model evaluation")
+        gr.Markdown("# Danusys Model Eval Platform\nYOLO fine-tuned model evaluation")
 
         val_state     = gr.State({})
         predict_state = gr.State([])
@@ -314,18 +383,26 @@ def build_demo() -> gr.Blocks:
         with gr.Row(equal_height=False):
 
             # ── Left: Config ──────────────────────────────────────────────────
-            with gr.Column(scale=1, min_width=300):
+            with gr.Column(scale=1, min_width=280):
 
                 gr.Markdown("### Model")
                 with gr.Row():
                     model_path_inp   = gr.Textbox(label="Model path (.pt)",
                                                   placeholder=r"D:\models\best.pt",
                                                   lines=1, scale=4, interactive=True)
-                    btn_browse_model = gr.Button("Browse", scale=1, min_width=64)
+                    btn_browse_model = gr.Button("Browse", scale=1, min_width=60)
+                with gr.Accordion("Upload model from your PC", open=False):
+                    model_upload_file = gr.File(
+                        label="Select .pt file",
+                        file_types=[".pt"],
+                        file_count="single",
+                    )
                 btn_load     = gr.Button("Load Model", variant="primary")
-                model_status = gr.Textbox(label="Status", interactive=False, lines=2)
-                classes_box  = gr.Textbox(label="Classes", interactive=False,
-                                          lines=6, max_lines=15)
+                model_status = gr.Textbox(label="Status", interactive=False, lines=1,
+                                          elem_classes=["model-status"])
+                with gr.Accordion("Classes", open=False):
+                    classes_box = gr.Textbox(interactive=False, lines=8,
+                                             max_lines=20, show_label=False)
 
                 gr.Markdown("### Dataset")
                 with gr.Row():
@@ -334,26 +411,35 @@ def build_demo() -> gr.Blocks:
                         placeholder=r"C:\datasets\cctv_test",
                         info="Supported: root/val/images · root/images · root/",
                         lines=1, scale=4, interactive=True)
-                    btn_browse_dataset = gr.Button("Browse", scale=1, min_width=64)
+                    btn_browse_dataset = gr.Button("Browse", scale=1, min_width=60)
+                with gr.Accordion("Upload dataset from your PC", open=False):
+                    gr.Markdown(
+                        "_Zip your dataset folder (images + labels) and upload here. "
+                        "Windows: sağ tık → Sıkıştır (.zip)_",
+                        elem_id="zip-hint",
+                    )
+                    dataset_upload_file = gr.File(
+                        label="Select dataset .zip",
+                        file_types=[".zip"],
+                        file_count="single",
+                    )
 
                 conf_slider = gr.Slider(
                     0.05, 0.95, value=0.25, step=0.05,
                     label="Confidence threshold",
-                    info="Keep predictions with score ≥ this. "
-                         "0.25 = accept only 25%+ confident detections.")
+                    info="Only keep predictions with score ≥ this value.")
 
                 iou_slider = gr.Slider(
                     0.10, 0.95, value=0.45, step=0.05,
                     label="IoU threshold  (Validation only)",
-                    info="Used internally by model.val() for NMS. "
-                         "Does NOT affect GT label matching.")
+                    info="Used by model.val() internally. Does not affect GT matching.")
 
                 iou_thresh_slider = gr.Slider(
                     0.10, 0.90, value=0.50, step=0.05,
                     label="GT match IoU  (TP / FP / FN)",
                     info="Spatial overlap needed to call a detection a True Positive. "
-                         "Example: 0.5 means the predicted box must overlap its GT box "
-                         "by ≥ 50% of the union area. Has nothing to do with confidence.")
+                         "Unrelated to confidence — two high-confidence boxes can still "
+                         "be FP if they don't overlap the GT box enough.")
 
                 gr.Markdown("### Run")
                 with gr.Row():
@@ -366,58 +452,80 @@ def build_demo() -> gr.Blocks:
             with gr.Column(scale=3):
                 with gr.Tabs():
 
+                    # ── Validation ────────────────────────────────────────────
                     with gr.Tab("Validation Metrics"):
                         gr.Markdown("Aggregate metrics from `model.val()` — requires GT label files.")
-                        gr.Markdown("#### Overall")
-                        val_summary_df = gr.DataFrame(interactive=False, wrap=True)
-                        gr.Markdown("#### Per-Class  (P / R / F1 / mAP50 / mAP50-95)")
-                        val_class_df   = gr.DataFrame(interactive=False, wrap=True)
+                        val_class_df = gr.DataFrame(interactive=False, wrap=True)
 
-                    with gr.Tab("Per-Image Results"):
-                        gr.Markdown(
-                            "Detection counts per image. "
-                            "GT columns appear when label files are found.")
-                        per_image_df = gr.DataFrame(interactive=False, wrap=True)
-
+                    # ── Image Viewer ──────────────────────────────────────────
                     with gr.Tab("Image Viewer"):
-                        gr.Markdown("Available after running Per-Image or Run Both.")
                         with gr.Row():
                             img_dropdown = gr.Dropdown(
-                                label="Select image", choices=[], interactive=True, scale=4)
-                            btn_view = gr.Button("Show Annotated", variant="secondary", scale=1)
-                        with gr.Tabs():
-                            with gr.Tab("Prediction (Annotated)"):
-                                with gr.Row():
-                                    annotated_img = gr.Image(label="Annotated",
-                                                             type="pil", scale=2)
-                                    det_df = gr.DataFrame(label="Detections",
-                                                          interactive=False, scale=1, wrap=True)
-                            with gr.Tab("GT Comparison"):
-                                gr.Markdown(
-                                    "**Colour key:**  Green = matched GT  |  "
-                                    "Lime dashed = TP pred  |  Red = FP  |  Orange = FN (missed)\n\n"
-                                    "_GT label (.txt) files must exist in the dataset._")
-                                btn_compare = gr.Button("Show GT Comparison", variant="primary")
-                                with gr.Row():
-                                    comparison_img = gr.Image(label="GT vs Prediction",
-                                                              type="pil", scale=2)
-                                    compare_df = gr.DataFrame(label="TP / FP / FN Detail",
-                                                              interactive=False, scale=1, wrap=True)
+                                label="Image", choices=[], interactive=True, scale=3)
+                            class_filter_dd = gr.Dropdown(
+                                label="Filter classes (empty = show all)",
+                                choices=[], multiselect=True, interactive=True, scale=2)
+                            btn_view = gr.Button("Refresh", variant="secondary",
+                                                 scale=1, min_width=80)
 
+                        with gr.Tabs():
+
+                            with gr.Tab("Prediction"):
+                                annotated_img = gr.Image(
+                                    label="Annotated image", type="pil",
+                                    height=600, show_download_button=True)
+                                gr.Markdown(
+                                    "_Click a row in the table below to highlight "
+                                    "that detection on the image._")
+                                det_df = gr.DataFrame(
+                                    label="Detections  (click row to highlight)",
+                                    interactive=False, wrap=True)
+
+                            with gr.Tab("GT Comparison"):
+                                gr.HTML("""
+<div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;
+            padding:9px 12px;background:#1e1e2e;border-radius:8px;margin-bottom:8px">
+  <span style="display:flex;align-items:center;gap:7px;color:#e0e0e0;font-size:0.9em">
+    <span style="width:16px;height:16px;background:#00c853;border:2px solid #00c853;
+                 display:inline-block;border-radius:2px;flex-shrink:0"></span>
+    <b>TP</b> — Correct detection
+  </span>
+  <span style="display:flex;align-items:center;gap:7px;color:#e0e0e0;font-size:0.9em">
+    <span style="width:16px;height:16px;background:#f44336;border:2px solid #f44336;
+                 display:inline-block;border-radius:2px;flex-shrink:0"></span>
+    <b>FP</b> — Extra detection, no GT match
+  </span>
+  <span style="display:flex;align-items:center;gap:7px;color:#e0e0e0;font-size:0.9em">
+    <span style="width:16px;height:16px;background:#ff9800;border:2px solid #ff9800;
+                 display:inline-block;border-radius:2px;flex-shrink:0"></span>
+    <b>FN</b> — Missed object
+  </span>
+</div>
+<p style="color:#888;font-size:0.82em;margin:4px 0 0 4px">
+  Requires GT label (.txt) files in the dataset.
+</p>
+""")
+                                btn_compare = gr.Button("Show GT Comparison",
+                                                        variant="primary")
+                                comparison_img = gr.Image(
+                                    label="GT vs Prediction", type="pil",
+                                    height=600, show_download_button=True)
+                                compare_df = gr.DataFrame(
+                                    label="TP / FP / FN Detail",
+                                    interactive=False, wrap=True)
+
+                    # ── Worst Images ──────────────────────────────────────────
                     with gr.Tab("Worst Images"):
                         gr.Markdown(
                             "GT available → sorted by most missed (FN).  \n"
                             "No GT → zero-detection + lowest confidence.  _(Top 20)_")
                         worst_df_out = gr.DataFrame(interactive=False, wrap=True)
 
-                    with gr.Tab("Quick Stats"):
-                        gr.Markdown("Per-class confidence statistics from the last predict run.")
-                        stats_df = gr.DataFrame(interactive=False, wrap=True)
-
+                    # ── Run History ───────────────────────────────────────────
                     with gr.Tab("Run History"):
                         gr.Markdown(
-                            "Every predict / validation run is logged here.  \n"
-                            "Persists across sessions (saved to `~/.model_eval_history.json`).")
+                            "Every run is logged here.  "
+                            "Persists across sessions (`~/.model_eval_history.json`).")
                         with gr.Row():
                             btn_refresh_history = gr.Button("Refresh", variant="secondary",
                                                             size="sm")
@@ -425,47 +533,55 @@ def build_demo() -> gr.Blocks:
                                                             size="sm")
                         history_df = gr.DataFrame(interactive=False, wrap=True)
 
+                    # ── Export ────────────────────────────────────────────────
                     with gr.Tab("Export"):
                         gr.Markdown(
-                            "**Excel sheets:** Summary · Val_Class_Metrics · Class_Performance · "
-                            "Per_Image · Per_Image_GT · All_Detections · Class_Distribution · "
-                            "Confusion_Matrix · Threshold_Curve · Size_Analysis · "
-                            "Worst_Images · Spatial_Bias")
-                        btn_export    = gr.Button("Generate Excel", variant="primary", size="lg")
+                            "**Excel sheets:** Summary · Val_Class_Metrics · "
+                            "Class_Performance · Per_Image · Per_Image_GT · "
+                            "All_Detections · Class_Distribution · Confusion_Matrix · "
+                            "Threshold_Curve · Size_Analysis · Worst_Images · Spatial_Bias")
+                        btn_export    = gr.Button("Generate Excel",
+                                                  variant="primary", size="lg")
                         export_status = gr.Textbox(label="Status", interactive=False, lines=1)
                         export_file   = gr.File(label="Download", interactive=False)
+
+                    # ── Per-Image (raw data, rarely needed) ───────────────────
+                    with gr.Tab("Per-Image Results"):
+                        gr.Markdown(
+                            "Detection counts per image. "
+                            "GT columns appear automatically when label files are found.")
+                        per_image_df = gr.DataFrame(interactive=False, wrap=True)
 
         # ── Wire-up ───────────────────────────────────────────────────────────
 
         btn_browse_model.click(browse_model_cb,   inputs=[], outputs=[model_path_inp])
         btn_browse_dataset.click(browse_dataset_cb, inputs=[], outputs=[dataset_inp])
+
+        # Upload: fill path inputs automatically when file is selected
+        model_upload_file.change(model_upload_cb,
+                                 inputs=[model_upload_file], outputs=[model_path_inp])
+        dataset_upload_file.change(dataset_zip_upload_cb,
+                                   inputs=[dataset_upload_file], outputs=[dataset_inp])
+
         btn_load.click(load_model_cb, inputs=[model_path_inp],
                        outputs=[model_status, classes_box])
 
-        # Validation — "Running..." on click, result on completion, history refresh
+        # Validation
         btn_val.click(
             lambda: "Running validation...", inputs=[], outputs=[run_status]
         ).then(
-            run_val_cb,
-            inputs=[dataset_inp, conf_slider, iou_slider],
-            outputs=[run_status, val_state, val_summary_df, val_class_df],
-        ).then(
-            _history_df, inputs=[], outputs=[history_df]
-        )
+            run_val_cb, inputs=[dataset_inp, conf_slider, iou_slider],
+            outputs=[run_status, val_state, val_class_df],
+        ).then(_history_df, inputs=[], outputs=[history_df])
 
         # Per-Image predict
         btn_predict.click(
             lambda: "Running analysis...", inputs=[], outputs=[run_status]
         ).then(
-            run_predict_cb,
-            inputs=[dataset_inp, conf_slider, iou_thresh_slider],
+            run_predict_cb, inputs=[dataset_inp, conf_slider, iou_thresh_slider],
             outputs=[run_status, predict_state, has_gt_state,
                      per_image_df, img_dropdown, worst_df_out],
-        ).then(
-            _stats_df, inputs=[predict_state], outputs=[stats_df]
-        ).then(
-            _history_df, inputs=[], outputs=[history_df]
-        )
+        ).then(_history_df, inputs=[], outputs=[history_df])
 
         # Run Both
         btn_both.click(
@@ -473,29 +589,44 @@ def build_demo() -> gr.Blocks:
         ).then(
             run_both_cb,
             inputs=[dataset_inp, conf_slider, iou_slider, iou_thresh_slider],
-            outputs=[run_status, val_state, val_summary_df, val_class_df,
+            outputs=[run_status, val_state, val_class_df,
                      predict_state, has_gt_state, per_image_df, img_dropdown, worst_df_out],
-        ).then(
-            _stats_df, inputs=[predict_state], outputs=[stats_df]
-        ).then(
-            _history_df, inputs=[], outputs=[history_df]
+        ).then(_history_df, inputs=[], outputs=[history_df])
+
+        # Image viewer — new image selected: reset filter, load all detections
+        view_inputs_load   = [img_dropdown, predict_state]
+        view_outputs_load  = [annotated_img, det_df, class_filter_dd]
+
+        img_dropdown.change(image_load_cb, view_inputs_load, view_outputs_load)
+        btn_view.click(image_load_cb, view_inputs_load, view_outputs_load)
+
+        # Class filter changed: re-draw with filter (keep selection)
+        class_filter_dd.change(
+            image_filter_cb,
+            inputs=[img_dropdown, predict_state, class_filter_dd],
+            outputs=[annotated_img, det_df],
         )
 
-        # Image viewer
-        img_dropdown.change(view_image_cb, [img_dropdown, predict_state], [annotated_img, det_df])
-        btn_view.click(view_image_cb, [img_dropdown, predict_state], [annotated_img, det_df])
+        # Row click in detection table → highlight that detection
+        det_df.select(
+            on_det_select,
+            inputs=[img_dropdown, predict_state, class_filter_dd],
+            outputs=[annotated_img],
+        )
+
+        # GT Comparison
         btn_compare.click(view_comparison_cb,
                           [img_dropdown, predict_state, has_gt_state],
                           [comparison_img, compare_df])
 
-        # History tab
+        # History
         btn_refresh_history.click(_history_df, inputs=[], outputs=[history_df])
         btn_clear_history.click(clear_history_cb, inputs=[], outputs=[history_df])
 
         # Export
         btn_export.click(export_cb, inputs=[], outputs=[export_status, export_file])
 
-        # Load history on startup
+        # Load history on app start
         demo.load(_history_df, inputs=[], outputs=[history_df])
 
     return demo

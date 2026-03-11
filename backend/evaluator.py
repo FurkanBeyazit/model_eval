@@ -69,23 +69,29 @@ class ModelEvaluator:
         return root
 
     def _create_yaml(self, dataset_path: str) -> str:
-        root = Path(dataset_path.strip().strip('"').strip("'"))
+        root = Path(dataset_path.strip().strip('"').strip("'")).resolve()
         for rel in ("val/images", "test/images", "images", "val", "."):
             if (root / rel).exists():
                 val_rel = rel
                 break
         else:
             val_rel = "."
-        yaml_content = {
-            "path": str(root.absolute()),
-            "train": val_rel,
-            "val": val_rel,
-            "nc": len(self.class_names),
-            "names": {int(k): v for k, v in self.class_names.items()},
-        }
+        # Forward slashes avoid PyYAML corrupting Windows backslash paths.
+        # Write as plain text — no yaml.dump — so there is zero serialisation ambiguity.
+        root_str = str(root).replace("\\", "/")
+        names_lines = "\n".join(
+            f"  {k}: {v}" for k, v in sorted(self.class_names.items(), key=lambda x: int(x[0]))
+        )
+        yaml_text = (
+            f"path: {root_str}\n"
+            f"train: {val_rel}\n"
+            f"val: {val_rel}\n"
+            f"nc: {len(self.class_names)}\n"
+            f"names:\n{names_lines}\n"
+        )
         yaml_path = Path(tempfile.gettempdir()) / "model_eval_temp.yaml"
-        with open(yaml_path, "w", encoding="utf-8") as f:
-            yaml.dump(yaml_content, f, allow_unicode=True)
+        yaml_path.write_text(yaml_text, encoding="utf-8")
+        print(f"[eval] yaml → {yaml_path}\n{yaml_text}")   # visible in backend console
         return str(yaml_path)
 
     # ──────────────────────────────── Validation ─────────────────────────────────
@@ -99,6 +105,7 @@ class ModelEvaluator:
             iou=iou,
             split="val",
             verbose=True,
+            cache=False,   # never use stale cache — forces fresh image scan
         )
 
         # Per-class metrics
@@ -468,10 +475,9 @@ class ModelEvaluator:
     # ─────────────────────────────── Annotation ──────────────────────────────────
 
     # GT comparison colours (BGR for OpenCV)
-    _GT_COLOUR   = (0,   210,   0)   # green  – TP matched GT box
-    _TP_COLOUR   = (50,  205,  50)   # lime   – TP prediction box
-    _FP_COLOUR   = (50,   50, 220)   # red    – False Positive prediction
-    _FN_COLOUR   = (0,  165, 255)    # orange – False Negative (missed GT)
+    _GT_COLOUR = (0,   210,   0)   # green  – TP matched GT box
+    _FP_COLOUR = (50,   50, 220)   # red    – False Positive prediction
+    _FN_COLOUR = (0,  165, 255)    # orange – False Negative (missed GT)
 
     def get_comparison_image(
         self,
@@ -494,11 +500,10 @@ class ModelEvaluator:
         font_scale = max(0.4, min(w, h) / 1500)
         thick = max(1, int(min(w, h) / 1000))
 
-        def _box(det, color, label_text, dash=False):
+        def _draw_rect(det, color, dash=False):
             x1 = max(0, int(det["x1"])); y1 = max(0, int(det["y1"]))
             x2 = min(w - 1, int(det["x2"])); y2 = min(h - 1, int(det["y2"]))
             if dash:
-                # Draw dashed rectangle manually
                 seg = 12
                 for sx in range(x1, x2, seg * 2):
                     cv2.line(img, (sx, y1), (min(sx + seg, x2), y1), color, thick)
@@ -508,20 +513,29 @@ class ModelEvaluator:
                     cv2.line(img, (x2, sy), (x2, min(sy + seg, y2)), color, thick)
             else:
                 cv2.rectangle(img, (x1, y1), (x2, y2), color, thick + 1)
+            return x1, y1
+
+        def _draw_label(x1, y1, color, label_text, offset_y=0):
             (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-            ly = max(y1 - 4, th + 8)
+            ly = max(y1 - 4 - offset_y, th + 8)
             cv2.rectangle(img, (x1, ly - th - 6), (x1 + tw + 6, ly + 2), color, -1)
             cv2.putText(img, label_text, (x1 + 3, ly - 2),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
+        # TP: GT box (solid) with label, pred box (dashed) without label — same location,
+        # two labels would overlap. IoU is included in the GT label.
         for pair in tp_pairs:
-            iou_str = f"{pair['iou']:.2f}"
-            _box(pair["gt"],   self._GT_COLOUR, f"GT:{pair['gt']['class_name']}")
-            _box(pair["pred"], self._TP_COLOUR, f"TP {iou_str}", dash=True)
+            x1, y1 = _draw_rect(pair["gt"], self._GT_COLOUR)
+            _draw_label(x1, y1, self._GT_COLOUR, pair["gt"]["class_name"])
+
         for p in fp_preds:
-            _box(p, self._FP_COLOUR, f"FP:{p['class_name']} {p['confidence']:.2f}")
+            x1, y1 = _draw_rect(p, self._FP_COLOUR)
+            _draw_label(x1, y1, self._FP_COLOUR,
+                        f"FP {p['class_name']} {p['confidence']:.2f}")
+
         for g in fn_gts:
-            _box(g, self._FN_COLOUR, f"FN:{g['class_name']}")
+            x1, y1 = _draw_rect(g, self._FN_COLOUR)
+            _draw_label(x1, y1, self._FN_COLOUR, f"FN {g['class_name']}")
 
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return Image.fromarray(img_rgb)
@@ -535,8 +549,12 @@ class ModelEvaluator:
     ]
 
     def get_annotated_image(
-        self, image_path: str, detections: List[dict]
+        self, image_path: str, detections: List[dict], highlight_idx: int = -1
     ) -> Optional[Image.Image]:
+        """
+        Draw detections on image.
+        highlight_idx: if >= 0, that detection gets a bright yellow halo border.
+        """
         img = cv2.imread(image_path)
         if img is None:
             return None
@@ -545,13 +563,22 @@ class ModelEvaluator:
         font_scale = max(0.4, min(w, h) / 1500)
         thickness  = max(1, int(min(w, h) / 1000))
 
-        for det in detections:
+        for i, det in enumerate(detections):
             cls_id = det["class_id"]
             color  = self._PALETTE[cls_id % len(self._PALETTE)]
             x1 = max(0, int(det["x1"])); y1 = max(0, int(det["y1"]))
             x2 = min(w - 1, int(det["x2"])); y2 = min(h - 1, int(det["y2"]))
 
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness + 1)
+            # Highlighted detection: yellow halo drawn first (behind the box)
+            if i == highlight_idx:
+                halo = thickness + 5
+                cv2.rectangle(img,
+                              (max(0, x1 - halo), max(0, y1 - halo)),
+                              (min(w - 1, x2 + halo), min(h - 1, y2 + halo)),
+                              (255, 230, 0), halo)
+
+            box_thick = (thickness + 3) if i == highlight_idx else (thickness + 1)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, box_thick)
             label = f"{det['class_name']} {det['confidence']:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
             label_y = max(y1 - 4, th + 8)
