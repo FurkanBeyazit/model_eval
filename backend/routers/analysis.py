@@ -31,6 +31,13 @@ class BothRequest(BaseModel):
 
 # ── History helpers ───────────────────────────────────────────────────────────
 
+def _model_name() -> str:
+    """Short model filename from loaded model path, e.g. 'best_v2.pt'."""
+    from pathlib import Path
+    p = state.evaluator.model_path
+    return Path(p).name if p else ""
+
+
 def _make_predict_entry(dataset_path: str, conf: float, iou_thresh: float,
                         results: list, has_gt: bool, run_type: str = "predict",
                         val_metrics: dict = None) -> dict:
@@ -48,6 +55,7 @@ def _make_predict_entry(dataset_path: str, conf: float, iou_thresh: float,
 
     entry: dict = {
         "Timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "Model":       _model_name(),
         "Run_Type":    run_type,
         "Dataset":     dataset_path,
         "Conf":        conf,
@@ -85,13 +93,14 @@ def validate(req: ValidateRequest):
     # Log to history
     entry = {
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "Model":     _model_name(),
         "Run_Type":  "validation",
         "Dataset":   req.dataset_path,
         "Conf":      req.conf,
         "Val_IoU":   req.iou,
         "mAP50":     metrics.get("map50", ""),
         "mAP50-95":  metrics.get("map50_95", ""),
-        "Precision":  metrics.get("mp", ""),
+        "Precision": metrics.get("mp", ""),
         "Recall":    metrics.get("mr", ""),
     }
     state.run_history.append(entry)
@@ -157,10 +166,6 @@ def both(req: BothRequest):
         },
     }
 
-
-@router.get("/image/list")
-def list_images():
-    return {"images": [r["image_name"] for r in state.last_predict_results]}
 
 
 @router.get("/image/annotated")

@@ -13,7 +13,7 @@ import pandas as pd
 import requests
 from PIL import Image
 
-API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
+API_BASE = os.environ.get("API_BASE", "http://localhost:8001")
 TIMEOUT  = 600
 
 
@@ -169,16 +169,29 @@ def _worst_images_df(results: list, has_gt: bool = False) -> pd.DataFrame:
     return df.head(20).reset_index(drop=True)
 
 
-def _val_combined_df(val_data: dict) -> pd.DataFrame:
-    mp = val_data.get("mp", 0)
-    mr = val_data.get("mr", 0)
-    f1_all = round(2 * mp * mr / (mp + mr), 4) if (mp + mr) > 0 else 0
-    rows = [{"Class": "all", "Precision": mp, "Recall": mr, "F1": f1_all,
-             "mAP50": val_data.get("map50", ""), "mAP50-95": val_data.get("map50_95", "")}]
+def _val_combined_df(val_data: dict, overall_p=None, overall_r=None) -> pd.DataFrame:
+    """Build the combined validation table (matches YOLO console output column order).
+    overall_p / overall_r: GT-matching based values — replace mp/mr in the 'all' row.
+    """
+    p = overall_p if overall_p is not None else val_data.get("mp", 0)
+    r = overall_r if overall_r is not None else val_data.get("mr", 0)
+    f1_all = round(2 * p * r / (p + r), 4) if (p + r) > 0 else 0
+    rows = [{
+        "Class": "all",
+        "Images":     val_data.get("total_images", ""),
+        "Instances":  val_data.get("total_instances", ""),
+        "Precision": p, "Recall": r, "F1": f1_all,
+        "mAP50": val_data.get("map50", ""),
+        "mAP50-95": val_data.get("map50_95", ""),
+    }]
     for m in val_data.get("class_metrics", []):
-        rows.append({"Class": m["class"], "Precision": m["Precision"],
-                     "Recall": m["Recall"], "F1": m["F1"],
-                     "mAP50": m["mAP50"], "mAP50-95": m["mAP50-95"]})
+        rows.append({
+            "Class":     m["class"],
+            "Images":    m.get("Images", ""),
+            "Instances": m.get("Instances", ""),
+            "Precision": m["Precision"], "Recall": m["Recall"], "F1": m["F1"],
+            "mAP50": m["mAP50"], "mAP50-95": m["mAP50-95"],
+        })
     return pd.DataFrame(rows)
 
 
@@ -186,7 +199,12 @@ def _history_df() -> pd.DataFrame:
     try:
         data = _get("/api/analysis/history").json()
         rows = data.get("history", [])
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        if "mAP50" in df.columns:
+            df = df.sort_values("mAP50", ascending=False, na_position="last")
+        return df.reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -261,10 +279,20 @@ def run_both_cb(dataset_path: str, conf: float, iou: float, iou_thresh: float):
         status  = (f"Val mAP50={val['map50']} | "
                    f"Predict: {pred['total_images']} images, "
                    f"{pred['total_detections']} detections{gt_note}")
+
+        # Use GT-matching P/R for the "all" row so it matches Run History
+        overall_p = overall_r = None
+        if has_gt:
+            total_tp = sum(r.get("tp", 0) for r in results)
+            total_fp = sum(r.get("fp", 0) for r in results)
+            total_fn = sum(r.get("fn", 0) for r in results)
+            overall_p = round(total_tp / (total_tp + total_fp), 4) if (total_tp + total_fp) > 0 else None
+            overall_r = round(total_tp / (total_tp + total_fn), 4) if (total_tp + total_fn) > 0 else None
+
         return (
             status,
             val,
-            _val_combined_df(val),
+            _val_combined_df(val, overall_p, overall_r),
             results, has_gt,
             _per_image_df(results, has_gt),
             gr.update(choices=names, value=names[0] if names else None),
@@ -350,6 +378,21 @@ def export_cb():
         tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         tmp.write(resp.content); tmp.close()
         return "Excel ready to download.", tmp.name
+    except Exception as exc:
+        return f"Error: {exc}", None
+
+
+def export_history_csv_cb():
+    try:
+        data = _get("/api/analysis/history").json()
+        rows = data.get("history", [])
+        if not rows:
+            return "No history to export.", None
+        df = pd.DataFrame(rows)
+        tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        df.to_csv(tmp.name, index=False, encoding="utf-8-sig")
+        tmp.close()
+        return "CSV ready.", tmp.name
     except Exception as exc:
         return f"Error: {exc}", None
 
@@ -529,8 +572,14 @@ def build_demo() -> gr.Blocks:
                         with gr.Row():
                             btn_refresh_history = gr.Button("Refresh", variant="secondary",
                                                             size="sm")
+                            btn_export_history  = gr.Button("Export CSV", variant="secondary",
+                                                            size="sm")
                             btn_clear_history   = gr.Button("Clear History", variant="stop",
                                                             size="sm")
+                        history_export_status = gr.Textbox(label="", interactive=False,
+                                                           lines=1, visible=False)
+                        history_export_file   = gr.File(label="Download CSV",
+                                                        interactive=False, visible=False)
                         history_df = gr.DataFrame(interactive=False, wrap=True)
 
                     # ── Export ────────────────────────────────────────────────
@@ -622,6 +671,15 @@ def build_demo() -> gr.Blocks:
         # History
         btn_refresh_history.click(_history_df, inputs=[], outputs=[history_df])
         btn_clear_history.click(clear_history_cb, inputs=[], outputs=[history_df])
+        btn_export_history.click(
+            export_history_csv_cb, inputs=[],
+            outputs=[history_export_status, history_export_file],
+        ).then(
+            lambda s, f: (gr.update(visible=bool(s), value=s),
+                          gr.update(visible=f is not None, value=f)),
+            inputs=[history_export_status, history_export_file],
+            outputs=[history_export_status, history_export_file],
+        )
 
         # Export
         btn_export.click(export_cb, inputs=[], outputs=[export_status, export_file])
@@ -634,7 +692,7 @@ def build_demo() -> gr.Blocks:
 
 if __name__ == "__main__":
     print("=" * 55)
-    print(f"  Frontend  →  http://localhost:7860")
+    print(f"  Frontend  →  http://localhost:7861")
     print(f"  Backend   →  {API_BASE}")
     print("=" * 55)
-    build_demo().launch(server_name="0.0.0.0", server_port=7860, share=True)
+    build_demo().launch(server_name="0.0.0.0", server_port=7861)

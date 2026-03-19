@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import tempfile
 from PIL import Image
 import gt_analyzer
+import io
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
@@ -96,16 +97,122 @@ class ModelEvaluator:
 
     # ──────────────────────────────── Validation ─────────────────────────────────
 
+    def _scan_labels(self, dataset_path: str) -> tuple:
+        """
+        Scan YOLO label (.txt) files to count Images and Instances per class.
+        Returns: (img_by_cls, inst_by_cls, total_images, total_instances)
+
+        Label directory search order (most specific first):
+          image_dir = root/val/images  →  tries root/val/labels, root/labels/val, root/labels
+          image_dir = root/val         →  tries root/val/labels, root/labels/val, root/labels
+          image_dir = root/images      →  tries root/labels, then root itself
+          image_dir = root             →  tries root/labels, then root itself
+        """
+        root = Path(dataset_path.strip().strip('"').strip("'"))
+
+        # Total image count from image directory
+        image_dir = self._find_image_dir(dataset_path)
+        total_images = (
+            sum(1 for f in image_dir.iterdir() if f.suffix.lower() in IMAGE_EXTS)
+            if image_dir and image_dir.exists() else 0
+        )
+
+        # Build ordered list of candidate label directories, most specific first.
+        # Critical: root/labels/ often contains ALL splits (train+val+test).
+        # We must prefer the split-specific directory to avoid counting train labels.
+        candidates: list[Path] = []
+        if image_dir:
+            if image_dir.name.lower() == "images":
+                # root/val/images → root/val/labels (sibling of images inside val/)
+                candidates.append(image_dir.parent / "labels")
+                # root/val/images → root/labels/val (YOLO alternate layout)
+                candidates.append(root / "labels" / image_dir.parent.name)
+                # Flat: .txt files in same dir as images
+                if any(image_dir.glob("*.txt")):
+                    candidates.append(image_dir)
+            else:
+                # root/val → root/val/labels (sub-dir called labels)
+                candidates.append(image_dir / "labels")
+                # root/val → root/labels/val (parallel tree)
+                candidates.append(root / "labels" / image_dir.name)
+                # Flat: .txt alongside images
+                if any(image_dir.glob("*.txt")):
+                    candidates.append(image_dir)
+            # Last resort: root/labels (all splits mixed — least preferred)
+            candidates.append(root / "labels")
+
+        labels_dir = None
+        for c in candidates:
+            if c.exists() and any(c.glob("*.txt")):
+                labels_dir = c
+                break
+
+        if labels_dir is None:
+            return {}, {}, total_images, 0
+
+        img_by_cls:  dict = {}
+        inst_by_cls: dict = {}
+        total_instances = 0
+
+        for label_file in sorted(labels_dir.glob("*.txt")):
+            classes_seen: set = set()
+            try:
+                lines = label_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                try:
+                    cls_id   = int(parts[0])
+                    cls_name = self.class_names.get(cls_id, f"cls_{cls_id}")
+                    inst_by_cls[cls_name] = inst_by_cls.get(cls_name, 0) + 1
+                    classes_seen.add(cls_name)
+                    total_instances += 1
+                except (ValueError, IndexError):
+                    continue
+            for cls_name in classes_seen:
+                img_by_cls[cls_name] = img_by_cls.get(cls_name, 0) + 1
+
+        return img_by_cls, inst_by_cls, total_images, total_instances
+
+    def _print_val_table(
+        self,
+        total_imgs: int, total_inst: int,
+        mp: float, mr: float, map50: float, map_val: float,
+        class_metrics: list,
+    ) -> None:
+        """Print a YOLO-style validation results table to the terminal."""
+        W = 88
+        print(f"\n{'Class':>22}{'Images':>11}{'Instances':>11}"
+              f"{'P':>11}{'R':>11}{'mAP50':>11}{'mAP50-95':>11}")
+        print("─" * W)
+        ti   = str(total_imgs) if total_imgs else "─"
+        ti_i = str(total_inst) if total_inst else "─"
+        print(f"{'all':>22}{ti:>11}{ti_i:>11}"
+              f"{mp:>11.3g}{mr:>11.3g}{map50:>11.3g}{map_val:>11.3g}")
+        for m in class_metrics:
+            imgs  = str(m["Images"])    if isinstance(m["Images"],    int) else ""
+            insts = str(m["Instances"]) if isinstance(m["Instances"], int) else ""
+            print(f"{m['class']:>22}{imgs:>11}{insts:>11}"
+                  f"{m['Precision']:>11.3g}{m['Recall']:>11.3g}"
+                  f"{m['mAP50']:>11.3g}{m['mAP50-95']:>11.3g}")
+        print("─" * W + "\n")
+
     def run_validation(self, dataset_path: str, conf: float = 0.25, iou: float = 0.45) -> dict:
         """Run model.val() — returns metrics + confusion matrix."""
+        # Scan label files first so Images / Instances are ready
+        _img_by_cls, _inst_by_cls, _total_images, _total_instances = \
+            self._scan_labels(dataset_path)
+
         yaml_file = self._create_yaml(dataset_path)
         metrics = self.model.val(
             data=yaml_file,
             conf=conf,
             iou=iou,
             split="val",
-            verbose=True,
-            cache=False,   # never use stale cache — forces fresh image scan
+            cache=False,   # prevent stale .cache files from causing wrong nc
         )
 
         # Per-class metrics
@@ -120,17 +227,27 @@ class ModelEvaluator:
             class_metrics.append({
                 "class":      cls_name,
                 "class_id":   int(cls_id),
-                "Precision":  round(float(metrics.box.p[i]),   4),
-                "Recall":     round(float(metrics.box.r[i]),   4),
-                "F1":         round(float(metrics.box.f1[i]),  4),
+                "Images":     _img_by_cls.get(cls_name, ""),
+                "Instances":  _inst_by_cls.get(cls_name, ""),
+                "Precision":  round(float(metrics.box.p[i]),    4),
+                "Recall":     round(float(metrics.box.r[i]),    4),
+                "F1":         round(float(metrics.box.f1[i]),   4),
                 "mAP50":      round(float(metrics.box.ap50[i]), 4),
-                "mAP50-95":   round(float(metrics.box.ap[i]),  4),
+                "mAP50-95":   round(float(metrics.box.ap[i]),   4),
             })
 
-        # ── Confusion Matrix ──────────────────────────────────────────────────
+        # Print YOLO-style table to terminal
+        self._print_val_table(
+            _total_images, _total_instances,
+            float(metrics.box.mp), float(metrics.box.mr),
+            float(metrics.box.map50), float(metrics.box.map),
+            class_metrics,
+        )
+
+        # Confusion Matrix
         cm_data = None
         try:
-            cm_matrix = metrics.confusion_matrix.matrix          # shape (nc+1, nc+1)
+            cm_matrix = metrics.confusion_matrix.matrix   # shape (nc+1, nc+1)
             nc = len(self.class_names)
             labels = [self.class_names.get(i, f"class_{i}") for i in range(nc)] + ["background"]
             cm_data = {
@@ -145,80 +262,11 @@ class ModelEvaluator:
             "map50_95":         round(float(metrics.box.map),   4),
             "mp":               round(float(metrics.box.mp),    4),
             "mr":               round(float(metrics.box.mr),    4),
+            "total_images":     _total_images,
+            "total_instances":  _total_instances,
             "class_metrics":    class_metrics,
             "confusion_matrix": cm_data,
         }
-
-    # ────────────────────────────── Per-Image Predict ────────────────────────────
-
-    def run_predict(self, dataset_path: str, conf: float = 0.25) -> List[dict]:
-        """Run model.predict() on every image. Stores image dims + normalised centres."""
-        image_dir = self._find_image_dir(dataset_path)
-        if image_dir is None:
-            raise ValueError(f"No images found in: {dataset_path}")
-
-        raw_results = self.model.predict(
-            source=str(image_dir),
-            conf=conf,
-            verbose=False,
-            stream=False,
-        )
-
-        results_list = []
-        for result in raw_results:
-            img_path = Path(result.path)
-            img_h, img_w = result.orig_shape[:2]   # (H, W)
-            detections: List[dict] = []
-
-            if result.boxes is not None and len(result.boxes) > 0:
-                boxes = result.boxes
-                for j in range(len(boxes)):
-                    cls_id   = int(boxes.cls[j])
-                    cls_name = self.class_names.get(cls_id, f"class_{cls_id}")
-                    conf_val = float(boxes.conf[j])
-                    xyxy     = boxes.xyxy[j].tolist()
-
-                    bw   = xyxy[2] - xyxy[0]
-                    bh   = xyxy[3] - xyxy[1]
-                    area = round(bw * bh, 1)
-
-                    # Normalised centre for spatial bias analysis
-                    cx_norm = round((xyxy[0] + xyxy[2]) / (2 * img_w), 4)
-                    cy_norm = round((xyxy[1] + xyxy[3]) / (2 * img_h), 4)
-
-                    detections.append({
-                        "class_id":   cls_id,
-                        "class_name": cls_name,
-                        "confidence": round(conf_val, 4),
-                        "x1": round(xyxy[0], 1), "y1": round(xyxy[1], 1),
-                        "x2": round(xyxy[2], 1), "y2": round(xyxy[3], 1),
-                        "width":   round(bw, 1),
-                        "height":  round(bh, 1),
-                        "area":    area,
-                        "cx_norm": cx_norm,
-                        "cy_norm": cy_norm,
-                    })
-
-            class_counts: Dict[str, int] = {}
-            class_confs:  Dict[str, List[float]] = {}
-            for det in detections:
-                cn = det["class_name"]
-                class_counts[cn] = class_counts.get(cn, 0) + 1
-                class_confs.setdefault(cn, []).append(det["confidence"])
-
-            results_list.append({
-                "image_path":      str(img_path),
-                "image_name":      img_path.name,
-                "img_width":       img_w,
-                "img_height":      img_h,
-                "total_detections": len(detections),
-                "class_counts":    class_counts,
-                "class_avg_conf":  {k: round(sum(v) / len(v), 4) for k, v in class_confs.items()},
-                "class_max_conf":  {k: round(max(v), 4)          for k, v in class_confs.items()},
-                "detections":      detections,
-            })
-
-        return results_list
 
     # ──────────────────────────── GT-Aware Predict ───────────────────────────────
 
