@@ -297,8 +297,8 @@ def _write_class_performance(writer, wb, predict_results: List[dict], all_classe
             "TP":        tp,
             "FP":        fp,
             "FN":        fn,
-            "Recall":    round(rec, 4),
             "Precision": round(prec, 4),
+            "Recall":    round(rec, 4),
             "F1":        round(f1, 4),
         })
 

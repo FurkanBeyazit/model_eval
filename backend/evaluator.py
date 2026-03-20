@@ -148,11 +148,12 @@ class ModelEvaluator:
                 break
 
         if labels_dir is None:
-            return {}, {}, total_images, 0
+            return {}, {}, total_images, 0, -1
 
         img_by_cls:  dict = {}
         inst_by_cls: dict = {}
         total_instances = 0
+        max_cls_id = -1
 
         for label_file in sorted(labels_dir.glob("*.txt")):
             classes_seen: set = set()
@@ -166,6 +167,8 @@ class ModelEvaluator:
                     continue
                 try:
                     cls_id   = int(parts[0])
+                    if cls_id > max_cls_id:
+                        max_cls_id = cls_id
                     cls_name = self.class_names.get(cls_id, f"cls_{cls_id}")
                     inst_by_cls[cls_name] = inst_by_cls.get(cls_name, 0) + 1
                     classes_seen.add(cls_name)
@@ -175,7 +178,7 @@ class ModelEvaluator:
             for cls_name in classes_seen:
                 img_by_cls[cls_name] = img_by_cls.get(cls_name, 0) + 1
 
-        return img_by_cls, inst_by_cls, total_images, total_instances
+        return img_by_cls, inst_by_cls, total_images, total_instances, max_cls_id
 
     def _print_val_table(
         self,
@@ -201,21 +204,55 @@ class ModelEvaluator:
         print("─" * W + "\n")
 
     def run_validation(self, dataset_path: str, conf: float = 0.25, iou: float = 0.45) -> dict:
-        """Run model.val() — returns metrics + confusion matrix."""
-        # Scan label files first so Images / Instances are ready
-        _img_by_cls, _inst_by_cls, _total_images, _total_instances = \
+        """Run model.val() — returns metrics + confusion matrix.
+
+        Class-count mismatch handling:
+          If the dataset contains label class IDs >= model.nc, we temporarily extend
+          model.names with dummy entries so YOLO's ConfusionMatrix and print_results
+          don't crash. Names are always restored via try/finally.
+        """
+        # 1. Scan labels — get Images/Instances counts AND max class id in dataset
+        _img_by_cls, _inst_by_cls, _total_images, _total_instances, _max_cls_id = \
             self._scan_labels(dataset_path)
 
-        yaml_file = self._create_yaml(dataset_path)
-        metrics = self.model.val(
-            data=yaml_file,
-            conf=conf,
-            iou=iou,
-            split="val",
-            cache=False,   # prevent stale .cache files from causing wrong nc
-        )
+        # 2. Detect class-count mismatch and extend nc in yaml if needed.
+        # We only update self.class_names (used by _create_yaml).
+        # self.model.names is intentionally NOT touched — it is a read-only
+        # property in some PyTorch versions and we don't need it:
+        #   verbose=False → print_results (which reads model.names) is skipped
+        #   plots=True    → plot_mc_curve only iterates ap_class_index (model's own
+        #                    classes 0..nc-1), so extended class ids never appear there
+        _model_nc       = len(self.class_names)
+        _original_names = None
+        if _max_cls_id >= _model_nc:
+            _original_names = dict(self.class_names)
+            extended = dict(self.class_names)
+            for cid in range(_model_nc, _max_cls_id + 1):
+                extended[cid] = f"cls_{cid}"
+            self.class_names = extended   # _create_yaml uses this for nc
+            print(f"[eval] class mismatch: model nc={_model_nc}, "
+                  f"dataset max_cls_id={_max_cls_id} → yaml nc={len(extended)}")
 
-        # Per-class metrics
+        _has_mismatch = _max_cls_id >= _model_nc
+        try:
+            yaml_file = self._create_yaml(dataset_path)  # nc = len(self.class_names)
+            metrics = self.model.val(
+                data=yaml_file,
+                conf=conf,
+                iou=iou,
+                split="val",
+                verbose=False,       # we print our own table via _print_val_table
+                plots=not _has_mismatch,  # mismatch: skip process_batch (IndexError)
+                cache=False,         # prevent stale .cache files from causing wrong nc
+            )
+        finally:
+            # Always restore — even if val() raises
+            if _original_names is not None:
+                self.class_names = _original_names
+
+        # Per-class metrics — skip extended (mismatch) classes so they don't
+        # pollute the "all" averages. A 10-class model has no knowledge of
+        # cls_10/11/12; including them as mAP=0 would unfairly drag down "all".
         ap_idx = (
             metrics.box.ap_class_index.tolist()
             if hasattr(metrics.box.ap_class_index, "tolist")
@@ -223,6 +260,8 @@ class ModelEvaluator:
         )
         class_metrics = []
         for i, cls_id in enumerate(ap_idx):
+            if int(cls_id) >= _model_nc:
+                continue   # skip extended dummy classes
             cls_name = metrics.names.get(int(cls_id), f"class_{cls_id}")
             class_metrics.append({
                 "class":      cls_name,
@@ -236,11 +275,22 @@ class ModelEvaluator:
                 "mAP50-95":   round(float(metrics.box.ap[i]),   4),
             })
 
+        # Recompute "all" averages from model's own classes only (mismatch-safe)
+        if class_metrics:
+            _mp     = sum(m["Precision"] for m in class_metrics) / len(class_metrics)
+            _mr     = sum(m["Recall"]    for m in class_metrics) / len(class_metrics)
+            _map50  = sum(m["mAP50"]     for m in class_metrics) / len(class_metrics)
+            _map    = sum(m["mAP50-95"]  for m in class_metrics) / len(class_metrics)
+        else:
+            _mp = float(metrics.box.mp)
+            _mr = float(metrics.box.mr)
+            _map50 = float(metrics.box.map50)
+            _map   = float(metrics.box.map)
+
         # Print YOLO-style table to terminal
         self._print_val_table(
             _total_images, _total_instances,
-            float(metrics.box.mp), float(metrics.box.mr),
-            float(metrics.box.map50), float(metrics.box.map),
+            _mp, _mr, _map50, _map,
             class_metrics,
         )
 
@@ -258,10 +308,10 @@ class ModelEvaluator:
             pass
 
         return {
-            "map50":            round(float(metrics.box.map50), 4),
-            "map50_95":         round(float(metrics.box.map),   4),
-            "mp":               round(float(metrics.box.mp),    4),
-            "mr":               round(float(metrics.box.mr),    4),
+            "map50":            round(_map50, 4),
+            "map50_95":         round(_map,   4),
+            "mp":               round(_mp,    4),
+            "mr":               round(_mr,    4),
             "total_images":     _total_images,
             "total_instances":  _total_instances,
             "class_metrics":    class_metrics,
