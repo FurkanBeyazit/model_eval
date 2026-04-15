@@ -244,6 +244,7 @@ class ModelEvaluator:
                 verbose=False,       # we print our own table via _print_val_table
                 plots=not _has_mismatch,  # mismatch: skip process_batch (IndexError)
                 cache=False,         # prevent stale .cache files from causing wrong nc
+                workers=0,           # disable multiprocessing (Windows pickle compat)
             )
         finally:
             # Always restore — even if val() raises

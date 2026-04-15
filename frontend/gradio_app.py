@@ -468,9 +468,10 @@ def build_demo() -> gr.Blocks:
                     )
 
                 conf_slider = gr.Slider(
-                    0.05, 0.95, value=0.25, step=0.05,
-                    label="Confidence threshold",
-                    info="Only keep predictions with score ≥ this value.")
+                    0.05, 0.95, value=0.50, step=0.05,
+                    label="Confidence threshold  (fixed)",
+                    info="Only keep predictions with score ≥ this value.",
+                    interactive=False)
 
                 iou_slider = gr.Slider(
                     0.10, 0.95, value=0.45, step=0.05,

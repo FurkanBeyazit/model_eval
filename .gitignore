@@ -116,3 +116,9 @@ frontend/*.pyc
 data/
 draw.py
 *.zip
+/docs
+/experiments
+/logs
+/pipeline
+/tools
+/models
