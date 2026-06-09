@@ -53,6 +53,21 @@ def _fetch_annotated(image_name: str, classes: str = "", highlight_idx: int = -1
         return None
 
 
+def _fetch_annotated_custom(image_path: str, detections: list, highlight_idx: int = -1):
+    """Annotate image using explicit detections list — does NOT depend on backend state."""
+    try:
+        resp = requests.post(
+            f"{API_BASE}/api/analysis/image/annotate_custom",
+            json={"image_path": image_path, "detections": detections,
+                  "highlight_idx": highlight_idx},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content))
+    except Exception:
+        return None
+
+
 def _build_det_df(dets: list) -> pd.DataFrame:
     if not dets:
         return pd.DataFrame(columns=["#", "Class", "Conf", "X1", "Y1", "X2", "Y2", "W", "H"])
@@ -368,6 +383,221 @@ def view_comparison_cb(image_name: str, predict_state: list, has_gt: bool):
     return pil_img, df
 
 
+# ── Model Comparison helpers ──────────────────────────────────────────────────
+
+def _run_one_model_for_compare(model_path, dataset_path,
+                                conf, iou, iou_thresh, label):
+    """Load a model, run both, return E02-filtered (first 33) results."""
+    if not model_path or not model_path.strip():
+        return None
+    model_name = os.path.basename(model_path.replace("\\", "/"))
+
+    load_resp = _post("/api/model/load", {"model_path": model_path})
+    if not load_resp.get("ok"):
+        return {"label": label, "model_name": model_name,
+                "error": load_resp.get("message", "Load failed"),
+                "val_metrics": {}, "results": [], "has_gt": False}
+    try:
+        data = _post("/api/analysis/both", {
+            "dataset_path": dataset_path,
+            "conf": conf, "iou": iou, "iou_thresh": iou_thresh,
+        })
+    except Exception as exc:
+        return {"label": label, "model_name": model_name,
+                "error": str(exc),
+                "val_metrics": {}, "results": [], "has_gt": False}
+
+    all_results = data["predict"]["results"]
+    e02 = [r for r in all_results
+           if r["image_name"].upper().startswith("E02")][:33]
+    return {
+        "label":       label,
+        "model_name":  model_name,
+        "error":       None,
+        "val_metrics": data["val_metrics"],
+        "results":     e02,
+        "has_gt":      data["predict"].get("has_gt", False),
+    }
+
+
+def _cmp_metrics_md(data) -> str:
+    if data is None:
+        return "_Not configured_"
+    if data.get("error"):
+        return f"**{data['model_name']}**\n\n⚠ {data['error']}"
+    v  = data["val_metrics"]
+    rs = data["results"]
+    total_dets = sum(r["total_detections"] for r in rs)
+    lines = [
+        f"### {data['model_name']}",
+        f"**mAP50:** {v.get('map50', '—')} &nbsp;|&nbsp; **mAP50-95:** {v.get('map50_95', '—')}",
+        f"**P:** {v.get('mp', '—')} &nbsp;|&nbsp; **R:** {v.get('mr', '—')}",
+        f"E02 images: **{len(rs)}** &nbsp;|&nbsp; Detections: **{total_dets}**",
+    ]
+    if data["has_gt"] and rs:
+        tp = sum(r.get("tp", 0) for r in rs)
+        fp = sum(r.get("fp", 0) for r in rs)
+        fn = sum(r.get("fn", 0) for r in rs)
+        p  = round(tp / (tp + fp), 3) if (tp + fp) > 0 else "—"
+        r_ = round(tp / (tp + fn), 3) if (tp + fn) > 0 else "—"
+        lines.append(f"TP: {tp} &nbsp;|&nbsp; FP: {fp} &nbsp;|&nbsp; FN: {fn}")
+        lines.append(f"GT-P: {p} &nbsp;|&nbsp; GT-R: {r_}")
+    return "\n\n".join(lines)
+
+
+def _cmp_table(models_data: list) -> pd.DataFrame:
+    """Per-image falldown catch table: GT | Model1_caught | Model2_caught | ...
+    Bottom rows show totals and catch rate (%).
+    If no GT labels, shows raw prediction counts instead.
+    """
+    valid = [d for d in models_data if d is not None and not d.get("error")]
+    if not valid:
+        return pd.DataFrame()
+
+    has_gt = any(d["has_gt"] for d in valid)
+
+    # Ordered unique E02 image names
+    all_names = []
+    seen = set()
+    for d in valid:
+        for r in d["results"]:
+            if r["image_name"] not in seen:
+                all_names.append(r["image_name"])
+                seen.add(r["image_name"])
+
+    model_totals = {d["model_name"]: 0 for d in valid}
+    gt_total = 0
+
+    rows = []
+    for name in all_names:
+        row = {"Image": name}
+
+        # GT column (same value regardless of model — use first valid model with GT)
+        if has_gt:
+            gt_val = ""
+            for d in valid:
+                r = next((x for x in d["results"] if x["image_name"] == name), None)
+                if r:
+                    gt_val = r.get("gt_counts", {}).get("falldown", 0)
+                    break
+            row["GT_Fall"] = gt_val
+            if isinstance(gt_val, int):
+                gt_total += gt_val
+
+        for d in valid:
+            r = next((x for x in d["results"] if x["image_name"] == name), None)
+            mn = d["model_name"]
+            if r is None:
+                if has_gt:
+                    row[f"{mn}_TP"] = ""
+                    row[f"{mn}_FP"] = ""
+                else:
+                    row[f"{mn}_pred"] = ""
+                continue
+            if has_gt:
+                tp = sum(1 for p in r.get("tp_pairs", [])
+                         if p["pred"]["class_name"] == "falldown")
+                fp = sum(1 for p in r.get("fp_preds", [])
+                         if p["class_name"] == "falldown")
+                row[f"{mn}_TP"] = tp
+                row[f"{mn}_FP"] = fp
+                model_totals[f"{mn}_TP"] = model_totals.get(f"{mn}_TP", 0) + tp
+                model_totals[f"{mn}_FP"] = model_totals.get(f"{mn}_FP", 0) + fp
+            else:
+                pred = r["class_counts"].get("falldown", 0)
+                row[f"{mn}_pred"] = pred
+                model_totals[f"{mn}_pred"] = model_totals.get(f"{mn}_pred", 0) + pred
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # ── Summary rows ──────────────────────────────────────────────────────────
+    total_row = {"Image": "── TOPLAM ──"}
+    pct_row   = {"Image": "── YAKALAMA % ──"}
+    if has_gt:
+        total_row["GT_Fall"] = gt_total
+        pct_row["GT_Fall"]   = "100%"
+    for d in valid:
+        mn = d["model_name"]
+        if has_gt:
+            tp_t = model_totals.get(f"{mn}_TP", 0)
+            fp_t = model_totals.get(f"{mn}_FP", 0)
+            recall = round(tp_t / gt_total * 100, 1) if gt_total > 0 else 0
+            total_row[f"{mn}_TP"] = tp_t
+            total_row[f"{mn}_FP"] = fp_t
+            pct_row[f"{mn}_TP"] = f"Recall {recall}%  ({tp_t}/{gt_total})"
+            pct_row[f"{mn}_FP"] = f"{fp_t} yanlış alarm"
+        else:
+            t = model_totals.get(f"{mn}_pred", 0)
+            total_row[f"{mn}_pred"] = t
+            pct_row[f"{mn}_pred"]   = "—"
+
+    df = pd.concat([df, pd.DataFrame([total_row, pct_row])], ignore_index=True)
+    return df
+
+
+def run_compare_cb(m1: str, m2: str, m3: str,
+                   dataset_path: str, conf: float,
+                   iou: float, iou_thresh: float):
+    """Run up to 3 models sequentially and return comparison results."""
+    if not dataset_path.strip():
+        _empty = gr.update(choices=[], value=None)
+        return ("Dataset path required.",
+                [None, None, None],
+                "_", "_", "_", pd.DataFrame(), _empty)
+
+    specs = [(m1, "Model 1"), (m2, "Model 2"), (m3, "Model 3")]
+    models_data = []
+    for mp, label in specs:
+        models_data.append(
+            _run_one_model_for_compare(mp, dataset_path, conf, iou, iou_thresh, label)
+        )
+
+    valid = [d for d in models_data if d is not None]
+    if not valid:
+        _empty = gr.update(choices=[], value=None)
+        return ("No valid models provided.",
+                models_data,
+                "_", "_", "_", pd.DataFrame(), _empty)
+
+    md1 = _cmp_metrics_md(models_data[0])
+    md2 = _cmp_metrics_md(models_data[1])
+    md3 = _cmp_metrics_md(models_data[2])
+    cdf = _cmp_table(models_data)
+
+    all_names = []
+    seen = set()
+    for d in valid:
+        for r in d["results"]:
+            if r["image_name"] not in seen:
+                all_names.append(r["image_name"])
+                seen.add(r["image_name"])
+
+    errors = [d["model_name"] for d in valid if d.get("error")]
+    status = (
+        f"Done — {len(valid)} model(s) | {len(all_names)} E02 images"
+        + (f" | Errors: {', '.join(errors)}" if errors else "")
+    )
+    return (status, models_data, md1, md2, md3, cdf,
+            gr.update(choices=all_names, value=all_names[0] if all_names else None))
+
+
+def compare_image_cb(image_name: str, models_data: list):
+    """Fetch annotated images for the selected image from all 3 model result sets."""
+    imgs = [None, None, None]
+    if not image_name or not models_data:
+        return imgs[0], imgs[1], imgs[2]
+    for i, d in enumerate(models_data):
+        if d is None or d.get("error"):
+            continue
+        r = next((x for x in d["results"] if x["image_name"] == image_name), None)
+        if r is None:
+            continue
+        imgs[i] = _fetch_annotated_custom(r["image_path"], r["detections"])
+    return imgs[0], imgs[1], imgs[2]
+
+
 # ── Export / history ──────────────────────────────────────────────────────────
 
 def export_cb():
@@ -602,6 +832,80 @@ def build_demo() -> gr.Blocks:
                             "GT columns appear automatically when label files are found.")
                         per_image_df = gr.DataFrame(interactive=False, wrap=True)
 
+                    # ── Model Comparison ──────────────────────────────────────
+                    with gr.Tab("Model Comparison"):
+                        gr.Markdown(
+                            "## Model Comparison\n"
+                            "Run up to **3 models** on the same dataset side-by-side.  \n"
+                            "Results are filtered to images whose filename starts with **E02** "
+                            "(first 33 images only).  \n"
+                            "_Conf / Val-IoU / GT-IoU sliders on the left are shared._")
+
+                        compare_state = gr.State([None, None, None])
+
+                        # ── Model path inputs ─────────────────────────────────
+                        with gr.Row():
+                            with gr.Column():
+                                cmp_m1 = gr.Textbox(
+                                    label="Model 1 (.pt)",
+                                    placeholder=r"D:\models\best_v1.pt",
+                                    interactive=True)
+                                btn_browse_cmp1 = gr.Button("Browse", size="sm")
+                            with gr.Column():
+                                cmp_m2 = gr.Textbox(
+                                    label="Model 2 (.pt)",
+                                    placeholder=r"D:\models\best_v2.pt",
+                                    interactive=True)
+                                btn_browse_cmp2 = gr.Button("Browse", size="sm")
+                            with gr.Column():
+                                cmp_m3 = gr.Textbox(
+                                    label="Model 3 (.pt) — optional",
+                                    placeholder=r"D:\models\best_v3.pt",
+                                    interactive=True)
+                                btn_browse_cmp3 = gr.Button("Browse", size="sm")
+
+                        with gr.Row():
+                            cmp_dataset = gr.Textbox(
+                                label="Dataset folder",
+                                placeholder=r"C:\datasets\cctv_test",
+                                scale=4, interactive=True)
+                            btn_browse_cmp_ds = gr.Button("Browse", scale=1, min_width=60)
+
+                        btn_compare_run = gr.Button(
+                            "Run Comparison", variant="primary", size="lg")
+                        compare_status = gr.Textbox(
+                            label="Status", interactive=False, lines=2)
+
+                        # ── Metrics cards ─────────────────────────────────────
+                        gr.Markdown("### Overall Metrics")
+                        with gr.Row():
+                            cmp_md1 = gr.Markdown("_Model 1 not run_")
+                            cmp_md2 = gr.Markdown("_Model 2 not run_")
+                            cmp_md3 = gr.Markdown("_Model 3 not run_")
+
+                        # ── Per-image comparison table ────────────────────────
+                        gr.Markdown(
+                            "### Falldown Yakalama Oranı — E02 subset\n"
+                            "**GT_Fall** = o resimde kaç gerçek falldown var &nbsp;|&nbsp; "
+                            "**Model sütunları** = kaç tanesini yakaladı &nbsp;|&nbsp; "
+                            "En altta toplam ve % _(GT etiket dosyası gerekir)_")
+                        cmp_table_out = gr.DataFrame(interactive=False, wrap=True)
+
+                        # ── Image viewer ──────────────────────────────────────
+                        gr.Markdown("### Image Viewer — select an E02 image")
+                        cmp_img_dd = gr.Dropdown(
+                            label="Image", choices=[], interactive=True)
+                        with gr.Row():
+                            cmp_img1 = gr.Image(
+                                label="Model 1", type="pil",
+                                height=480, show_download_button=True)
+                            cmp_img2 = gr.Image(
+                                label="Model 2", type="pil",
+                                height=480, show_download_button=True)
+                            cmp_img3 = gr.Image(
+                                label="Model 3", type="pil",
+                                height=480, show_download_button=True)
+
         # ── Wire-up ───────────────────────────────────────────────────────────
 
         btn_browse_model.click(browse_model_cb,   inputs=[], outputs=[model_path_inp])
@@ -684,6 +988,32 @@ def build_demo() -> gr.Blocks:
 
         # Export
         btn_export.click(export_cb, inputs=[], outputs=[export_status, export_file])
+
+        # Model Comparison — browse buttons
+        btn_browse_cmp1.click(browse_model_cb, inputs=[], outputs=[cmp_m1])
+        btn_browse_cmp2.click(browse_model_cb, inputs=[], outputs=[cmp_m2])
+        btn_browse_cmp3.click(browse_model_cb, inputs=[], outputs=[cmp_m3])
+        btn_browse_cmp_ds.click(browse_dataset_cb, inputs=[], outputs=[cmp_dataset])
+
+        # Model Comparison — run
+        btn_compare_run.click(
+            lambda: "Running comparison — this may take several minutes...",
+            inputs=[], outputs=[compare_status],
+        ).then(
+            run_compare_cb,
+            inputs=[cmp_m1, cmp_m2, cmp_m3, cmp_dataset,
+                    conf_slider, iou_slider, iou_thresh_slider],
+            outputs=[compare_status, compare_state,
+                     cmp_md1, cmp_md2, cmp_md3,
+                     cmp_table_out, cmp_img_dd],
+        )
+
+        # Model Comparison — image viewer
+        cmp_img_dd.change(
+            compare_image_cb,
+            inputs=[cmp_img_dd, compare_state],
+            outputs=[cmp_img1, cmp_img2, cmp_img3],
+        )
 
         # Load history on app start
         demo.load(_history_df, inputs=[], outputs=[history_df])

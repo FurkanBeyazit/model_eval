@@ -1,5 +1,6 @@
 import io
 from datetime import datetime
+from typing import Any, Dict, List
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -210,6 +211,31 @@ def get_comparison_image(image_name: str):
     )
     if pil_img is None:
         raise HTTPException(500, f"Could not read image file: {result['image_path']}")
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/jpeg")
+
+
+# ── Custom annotate (for model comparison tab) ───────────────────────────────
+
+class AnnotateCustomRequest(BaseModel):
+    image_path: str
+    detections: List[Dict[str, Any]]
+    highlight_idx: int = -1
+
+
+@router.post("/image/annotate_custom")
+def annotate_custom(req: AnnotateCustomRequest):
+    """Annotate an image using an explicit detections list (not server state).
+    Used by the comparison tab to show all models' boxes without re-running."""
+    if state.evaluator.model is None:
+        raise HTTPException(400, "Model not loaded.")
+    pil_img = state.evaluator.get_annotated_image(
+        req.image_path, req.detections, highlight_idx=req.highlight_idx
+    )
+    if pil_img is None:
+        raise HTTPException(500, f"Could not read image: {req.image_path}")
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=92)
     buf.seek(0)
