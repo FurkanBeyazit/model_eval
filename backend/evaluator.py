@@ -647,6 +647,107 @@ class ModelEvaluator:
         (160,  80,   0),
     ]
 
+    # ──────────────────────────────── Benchmark ──────────────────────────────────
+
+    def run_benchmark(
+        self,
+        dataset_path: str,
+        n_warmup: int = 20,
+        n_measure: int = 50,
+    ) -> dict:
+        """Measure inference speed: batch=1 latency and batch=8 throughput.
+
+        Uses torch.cuda.synchronize() so timings reflect actual GPU completion,
+        not just CPU dispatch. Warm-up prevents cold-start CUDA kernel bias.
+        """
+        import time
+        import torch
+
+        image_dir = self._find_image_dir(dataset_path)
+        if image_dir is None:
+            raise ValueError(f"No images found in: {dataset_path}")
+
+        images = sorted(
+            str(f) for f in image_dir.iterdir() if f.suffix.lower() in IMAGE_EXTS
+        )
+        if not images:
+            raise ValueError("No images found")
+
+        use_cuda = torch.cuda.is_available()
+        device   = "cuda" if use_cuda else "cpu"
+
+        # Model metadata
+        model_size_mb: Optional[float] = None
+        params_m: Optional[float]      = None
+        if self.model_path:
+            try:
+                model_size_mb = round(Path(self.model_path).stat().st_size / 1024 ** 2, 1)
+            except Exception:
+                pass
+        try:
+            params_m = round(
+                sum(p.numel() for p in self.model.model.parameters()) / 1e6, 1
+            )
+        except Exception:
+            pass
+
+        # Repeat image list if dataset is smaller than n_measure
+        factor     = (max(n_warmup, n_measure) // len(images)) + 2
+        pool       = images * factor
+        warmup_lst = pool[:n_warmup]
+        meas_lst   = pool[:n_measure]
+
+        # ── Warm-up ───────────────────────────────────────────────────────────
+        self.model.predict(source=warmup_lst, conf=0.25, verbose=False, stream=False)
+        if use_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
+        # ── Batch = 1  (single-frame latency — CCTV real-time) ────────────────
+        t0 = time.perf_counter()
+        for img in meas_lst:
+            self.model.predict(source=img, conf=0.25, verbose=False, stream=False)
+        if use_cuda:
+            torch.cuda.synchronize()
+        elapsed_b1 = time.perf_counter() - t0
+
+        inf_ms = round(elapsed_b1 * 1000 / len(meas_lst), 2)
+        fps_b1 = round(len(meas_lst) / elapsed_b1, 1)
+        vram_b1: Optional[float] = None
+        if use_cuda:
+            vram_b1 = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+            torch.cuda.reset_peak_memory_stats()
+
+        # ── Batch = 8  (multi-stream throughput) ─────────────────────────────
+        batch_sz = 8
+        batches  = [meas_lst[i: i + batch_sz] for i in range(0, len(meas_lst), batch_sz)]
+        n_b8     = sum(len(b) for b in batches)
+
+        t0 = time.perf_counter()
+        for batch in batches:
+            self.model.predict(source=batch, conf=0.25, verbose=False, stream=False)
+        if use_cuda:
+            torch.cuda.synchronize()
+        elapsed_b8 = time.perf_counter() - t0
+
+        fps_b8   = round(n_b8 / elapsed_b8, 1)
+        vram_b8: Optional[float] = None
+        if use_cuda:
+            vram_b8 = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+
+        return {
+            "inf_ms":        inf_ms,
+            "fps_b1":        fps_b1,
+            "fps_b8":        fps_b8,
+            "vram_b1_gb":    vram_b1,
+            "vram_b8_gb":    vram_b8,
+            "model_size_mb": model_size_mb,
+            "params_m":      params_m,
+            "n_images":      len(meas_lst),
+            "n_warmup":      n_warmup,
+            "device":        device,
+        }
+
     def get_annotated_image(
         self, image_path: str, detections: List[dict], highlight_idx: int = -1
     ) -> Optional[Image.Image]:

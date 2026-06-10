@@ -387,7 +387,7 @@ def view_comparison_cb(image_name: str, predict_state: list, has_gt: bool):
 
 def _run_one_model_for_compare(model_path, dataset_path,
                                 conf, iou, iou_thresh, label):
-    """Load a model, run both, return E02-filtered (first 33) results."""
+    """Load a model, run both + benchmark, return full dataset results."""
     if not model_path or not model_path.strip():
         return None
     model_name = os.path.basename(model_path.replace("\\", "/"))
@@ -396,7 +396,7 @@ def _run_one_model_for_compare(model_path, dataset_path,
     if not load_resp.get("ok"):
         return {"label": label, "model_name": model_name,
                 "error": load_resp.get("message", "Load failed"),
-                "val_metrics": {}, "results": [], "has_gt": False}
+                "val_metrics": {}, "results": [], "has_gt": False, "benchmark": {}}
     try:
         data = _post("/api/analysis/both", {
             "dataset_path": dataset_path,
@@ -405,18 +405,27 @@ def _run_one_model_for_compare(model_path, dataset_path,
     except Exception as exc:
         return {"label": label, "model_name": model_name,
                 "error": str(exc),
-                "val_metrics": {}, "results": [], "has_gt": False}
+                "val_metrics": {}, "results": [], "has_gt": False, "benchmark": {}}
+
+    bench = {}
+    try:
+        bench = _post("/api/analysis/benchmark", {
+            "dataset_path": dataset_path,
+            "n_warmup": 20,
+            "n_measure": 50,
+        })
+    except Exception:
+        pass
 
     all_results = data["predict"]["results"]
-    e02 = [r for r in all_results
-           if r["image_name"].upper().startswith("E02")][:33]
     return {
         "label":       label,
         "model_name":  model_name,
         "error":       None,
         "val_metrics": data["val_metrics"],
-        "results":     e02,
+        "results":     all_results,
         "has_gt":      data["predict"].get("has_gt", False),
+        "benchmark":   bench,
     }
 
 
@@ -425,14 +434,15 @@ def _cmp_metrics_md(data) -> str:
         return "_Not configured_"
     if data.get("error"):
         return f"**{data['model_name']}**\n\n⚠ {data['error']}"
-    v  = data["val_metrics"]
-    rs = data["results"]
+    v     = data["val_metrics"]
+    rs    = data["results"]
+    bench = data.get("benchmark", {})
     total_dets = sum(r["total_detections"] for r in rs)
     lines = [
         f"### {data['model_name']}",
         f"**mAP50:** {v.get('map50', '—')} &nbsp;|&nbsp; **mAP50-95:** {v.get('map50_95', '—')}",
         f"**P:** {v.get('mp', '—')} &nbsp;|&nbsp; **R:** {v.get('mr', '—')}",
-        f"E02 images: **{len(rs)}** &nbsp;|&nbsp; Detections: **{total_dets}**",
+        f"Images: **{len(rs)}** &nbsp;|&nbsp; Detections: **{total_dets}**",
     ]
     if data["has_gt"] and rs:
         tp = sum(r.get("tp", 0) for r in rs)
@@ -442,7 +452,49 @@ def _cmp_metrics_md(data) -> str:
         r_ = round(tp / (tp + fn), 3) if (tp + fn) > 0 else "—"
         lines.append(f"TP: {tp} &nbsp;|&nbsp; FP: {fp} &nbsp;|&nbsp; FN: {fn}")
         lines.append(f"GT-P: {p} &nbsp;|&nbsp; GT-R: {r_}")
+    if bench:
+        lines.append("---")
+        fps_b1 = bench.get("fps_b1", "—")
+        fps_b8 = bench.get("fps_b8", "—")
+        inf_ms = bench.get("inf_ms", "—")
+        vram   = bench.get("vram_b8_gb")
+        size   = bench.get("model_size_mb", "—")
+        device = bench.get("device", "")
+        lines.append(
+            f"**Inf.ms:** {inf_ms} &nbsp;|&nbsp; "
+            f"**FPS(b=1):** {fps_b1} &nbsp;|&nbsp; "
+            f"**FPS(b=8):** {fps_b8}"
+        )
+        vram_str = f"{vram} GB" if vram is not None else "N/A (CPU)"
+        lines.append(
+            f"**VRAM(b=8):** {vram_str} &nbsp;|&nbsp; "
+            f"**Size:** {size} MB &nbsp;|&nbsp; "
+            f"**Device:** {device}"
+        )
     return "\n\n".join(lines)
+
+
+def _cmp_summary_table(models_data: list) -> pd.DataFrame:
+    rows = []
+    for d in models_data:
+        if d is None:
+            continue
+        v     = d.get("val_metrics", {})
+        bench = d.get("benchmark", {})
+        vram  = bench.get("vram_b8_gb")
+        rows.append({
+            "Model":      d["model_name"],
+            "mAP50":      v.get("map50",    "—"),
+            "mAP50-95":   v.get("map50_95", "—"),
+            "Precision":  v.get("mp",       "—"),
+            "Recall":     v.get("mr",       "—"),
+            "Inf.ms":     bench.get("inf_ms",  "—"),
+            "FPS(b=1)":   bench.get("fps_b1",  "—"),
+            "FPS(b=8)":   bench.get("fps_b8",  "—"),
+            "VRAM(GB)":   f"{vram}" if vram is not None else "—",
+            "Size(MB)":   bench.get("model_size_mb", "—"),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def _cmp_table(models_data: list) -> pd.DataFrame:
@@ -456,7 +508,7 @@ def _cmp_table(models_data: list) -> pd.DataFrame:
 
     has_gt = any(d["has_gt"] for d in valid)
 
-    # Ordered unique E02 image names
+    # Ordered unique image names
     all_names = []
     seen = set()
     for d in valid:
@@ -545,7 +597,7 @@ def run_compare_cb(m1: str, m2: str, m3: str,
         _empty = gr.update(choices=[], value=None)
         return ("Dataset path required.",
                 [None, None, None],
-                "_", "_", "_", pd.DataFrame(), _empty)
+                pd.DataFrame(), "_", "_", "_", pd.DataFrame(), _empty)
 
     specs = [(m1, "Model 1"), (m2, "Model 2"), (m3, "Model 3")]
     models_data = []
@@ -559,12 +611,13 @@ def run_compare_cb(m1: str, m2: str, m3: str,
         _empty = gr.update(choices=[], value=None)
         return ("No valid models provided.",
                 models_data,
-                "_", "_", "_", pd.DataFrame(), _empty)
+                pd.DataFrame(), "_", "_", "_", pd.DataFrame(), _empty)
 
     md1 = _cmp_metrics_md(models_data[0])
     md2 = _cmp_metrics_md(models_data[1])
     md3 = _cmp_metrics_md(models_data[2])
     cdf = _cmp_table(models_data)
+    summary_df = _cmp_summary_table(models_data)
 
     all_names = []
     seen = set()
@@ -576,10 +629,10 @@ def run_compare_cb(m1: str, m2: str, m3: str,
 
     errors = [d["model_name"] for d in valid if d.get("error")]
     status = (
-        f"Done — {len(valid)} model(s) | {len(all_names)} E02 images"
+        f"Done — {len(valid)} model(s) | {len(all_names)} images"
         + (f" | Errors: {', '.join(errors)}" if errors else "")
     )
-    return (status, models_data, md1, md2, md3, cdf,
+    return (status, models_data, summary_df, md1, md2, md3, cdf,
             gr.update(choices=all_names, value=all_names[0] if all_names else None))
 
 
@@ -599,6 +652,37 @@ def compare_image_cb(image_name: str, models_data: list):
 
 
 # ── Export / history ──────────────────────────────────────────────────────────
+
+def run_benchmark_single_cb(dataset_path: str):
+    if not _check_backend():
+        return "Backend not running.", pd.DataFrame()
+    if not dataset_path.strip():
+        return "Dataset path required.", pd.DataFrame()
+    try:
+        data = _post("/api/analysis/benchmark", {
+            "dataset_path": dataset_path,
+            "n_warmup": 20,
+            "n_measure": 50,
+        })
+        vram = data.get("vram_b8_gb")
+        df = pd.DataFrame([{
+            "Inf.ms":    data.get("inf_ms",        "—"),
+            "FPS(b=1)":  data.get("fps_b1",         "—"),
+            "FPS(b=8)":  data.get("fps_b8",         "—"),
+            "VRAM(GB)":  f"{vram}" if vram is not None else "N/A",
+            "Size(MB)":  data.get("model_size_mb",  "—"),
+            "Params(M)": data.get("params_m",        "—"),
+            "Device":    data.get("device",          "—"),
+            "N_images":  data.get("n_images",        "—"),
+        }])
+        return (
+            f"Benchmark done — {data.get('n_images', '?')} images "
+            f"({data.get('n_warmup', '?')} warm-up, device: {data.get('device', '?')})",
+            df,
+        )
+    except Exception as exc:
+        return f"Error: {exc}", pd.DataFrame()
+
 
 def export_cb():
     try:
@@ -719,7 +803,8 @@ def build_demo() -> gr.Blocks:
                 with gr.Row():
                     btn_val     = gr.Button("Validation",  variant="secondary", size="sm")
                     btn_predict = gr.Button("Per-Image",   variant="secondary", size="sm")
-                btn_both   = gr.Button("Run Both", variant="primary")
+                btn_both      = gr.Button("Run Both", variant="primary")
+                btn_benchmark = gr.Button("Benchmark", variant="secondary", size="sm")
                 run_status = gr.Textbox(label="Status", interactive=False, lines=2)
 
             # ── Right: Results ────────────────────────────────────────────────
@@ -730,6 +815,13 @@ def build_demo() -> gr.Blocks:
                     with gr.Tab("Validation Metrics"):
                         gr.Markdown("Aggregate metrics from `model.val()` — requires GT label files.")
                         val_class_df = gr.DataFrame(interactive=False, wrap=True)
+                        gr.Markdown("#### Speed Benchmark")
+                        gr.Markdown(
+                            "_20 warm-up + 50 ölçüm &nbsp;|&nbsp; "
+                            "b=1: tek kamera gerçek zamanlı &nbsp;|&nbsp; "
+                            "b=8: çok kamera paralel throughput_"
+                        )
+                        bench_df = gr.DataFrame(interactive=False, wrap=True)
 
                     # ── Image Viewer ──────────────────────────────────────────
                     with gr.Tab("Image Viewer"):
@@ -837,8 +929,7 @@ def build_demo() -> gr.Blocks:
                         gr.Markdown(
                             "## Model Comparison\n"
                             "Run up to **3 models** on the same dataset side-by-side.  \n"
-                            "Results are filtered to images whose filename starts with **E02** "
-                            "(first 33 images only).  \n"
+                            "Tüm dataset üzerinde çalışır.  \n"
                             "_Conf / Val-IoU / GT-IoU sliders on the left are shared._")
 
                         compare_state = gr.State([None, None, None])
@@ -876,8 +967,17 @@ def build_demo() -> gr.Blocks:
                         compare_status = gr.Textbox(
                             label="Status", interactive=False, lines=2)
 
+                        # ── Summary table (mAP + Speed) ───────────────────────
+                        gr.Markdown("### Karşılaştırma Özeti — mAP + Hız")
+                        gr.Markdown(
+                            "_Inf.ms · FPS(b=1): tek kamera gerçek zamanlı &nbsp;|&nbsp; "
+                            "FPS(b=8): çok kamera paralel &nbsp;|&nbsp; "
+                            "VRAM: batch=8 tepe bellek_"
+                        )
+                        cmp_summary_out = gr.DataFrame(interactive=False, wrap=True)
+
                         # ── Metrics cards ─────────────────────────────────────
-                        gr.Markdown("### Overall Metrics")
+                        gr.Markdown("### Detaylı Metrikler")
                         with gr.Row():
                             cmp_md1 = gr.Markdown("_Model 1 not run_")
                             cmp_md2 = gr.Markdown("_Model 2 not run_")
@@ -885,14 +985,14 @@ def build_demo() -> gr.Blocks:
 
                         # ── Per-image comparison table ────────────────────────
                         gr.Markdown(
-                            "### Falldown Yakalama Oranı — E02 subset\n"
+                            "### Falldown Yakalama Oranı\n"
                             "**GT_Fall** = o resimde kaç gerçek falldown var &nbsp;|&nbsp; "
                             "**Model sütunları** = kaç tanesini yakaladı &nbsp;|&nbsp; "
                             "En altta toplam ve % _(GT etiket dosyası gerekir)_")
                         cmp_table_out = gr.DataFrame(interactive=False, wrap=True)
 
                         # ── Image viewer ──────────────────────────────────────
-                        gr.Markdown("### Image Viewer — select an E02 image")
+                        gr.Markdown("### Image Viewer")
                         cmp_img_dd = gr.Dropdown(
                             label="Image", choices=[], interactive=True)
                         with gr.Row():
@@ -907,6 +1007,14 @@ def build_demo() -> gr.Blocks:
                                 height=480, show_download_button=True)
 
         # ── Wire-up ───────────────────────────────────────────────────────────
+
+        btn_benchmark.click(
+            lambda: "Running benchmark...", inputs=[], outputs=[run_status]
+        ).then(
+            run_benchmark_single_cb,
+            inputs=[dataset_inp],
+            outputs=[run_status, bench_df],
+        )
 
         btn_browse_model.click(browse_model_cb,   inputs=[], outputs=[model_path_inp])
         btn_browse_dataset.click(browse_dataset_cb, inputs=[], outputs=[dataset_inp])
@@ -1004,6 +1112,7 @@ def build_demo() -> gr.Blocks:
             inputs=[cmp_m1, cmp_m2, cmp_m3, cmp_dataset,
                     conf_slider, iou_slider, iou_thresh_slider],
             outputs=[compare_status, compare_state,
+                     cmp_summary_out,
                      cmp_md1, cmp_md2, cmp_md3,
                      cmp_table_out, cmp_img_dd],
         )

@@ -242,6 +242,27 @@ def annotate_custom(req: AnnotateCustomRequest):
     return StreamingResponse(buf, media_type="image/jpeg")
 
 
+# ── Benchmark ────────────────────────────────────────────────────────────────
+
+class BenchmarkRequest(BaseModel):
+    dataset_path: str
+    n_warmup: int = 20
+    n_measure: int = 50
+
+
+@router.post("/benchmark")
+def benchmark(req: BenchmarkRequest):
+    if state.evaluator.model is None:
+        raise HTTPException(400, "Model not loaded. Call /api/model/load first.")
+    try:
+        result = state.evaluator.run_benchmark(
+            req.dataset_path, req.n_warmup, req.n_measure
+        )
+        return result
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 # ── History endpoints ─────────────────────────────────────────────────────────
 
 @router.get("/history")
