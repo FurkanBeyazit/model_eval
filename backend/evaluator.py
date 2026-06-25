@@ -155,6 +155,9 @@ class ModelEvaluator:
         total_instances = 0
         max_cls_id = -1
 
+        # Reverse map for named labels: lowercase name → class_id
+        name_to_id = {v.lower(): k for k, v in self.class_names.items()}
+
         for label_file in sorted(labels_dir.glob("*.txt")):
             classes_seen: set = set()
             try:
@@ -166,14 +169,20 @@ class ModelEvaluator:
                 if not parts:
                     continue
                 try:
-                    cls_id   = int(parts[0])
+                    cls_id = int(parts[0])
+                except (ValueError, IndexError):
+                    # Named-class format (e.g. "person 0.5 0.5 0.3 0.4")
+                    cls_id = name_to_id.get(parts[0].lower() if parts else "")
+                    if cls_id is None:
+                        continue
+                try:
                     if cls_id > max_cls_id:
                         max_cls_id = cls_id
                     cls_name = self.class_names.get(cls_id, f"cls_{cls_id}")
                     inst_by_cls[cls_name] = inst_by_cls.get(cls_name, 0) + 1
                     classes_seen.add(cls_name)
                     total_instances += 1
-                except (ValueError, IndexError):
+                except (TypeError, IndexError):
                     continue
             for cls_name in classes_seen:
                 img_by_cls[cls_name] = img_by_cls.get(cls_name, 0) + 1

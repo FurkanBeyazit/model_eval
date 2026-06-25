@@ -42,10 +42,16 @@ def load_gt_boxes(
     """
     Load YOLO label file and return GT boxes as absolute xyxy dicts.
     Returns [] when no label file is found (unlabelled image).
+
+    Supports both numeric-id format  (0 cx cy w h)
+    and named-class format           (person cx cy w h).
     """
     label_path = find_label_path(image_path)
     if label_path is None:
         return []
+
+    # Reverse map for named labels: lowercase name → class_id
+    name_to_id: Dict[str, int] = {v.lower(): k for k, v in class_names.items()}
 
     gt_boxes: List[dict] = []
     with open(label_path, encoding="utf-8") as f:
@@ -53,8 +59,18 @@ def load_gt_boxes(
             parts = line.strip().split()
             if len(parts) < 5:
                 continue
-            cls_id = int(parts[0])
-            cx, cy, nw, nh = (float(x) for x in parts[1:5])
+            try:
+                cls_id = int(parts[0])
+                cx, cy, nw, nh = (float(x) for x in parts[1:5])
+            except ValueError:
+                # First token is a class name (labels_with_name format)
+                cls_id = name_to_id.get(parts[0].lower())
+                if cls_id is None:
+                    continue  # unknown class name — skip
+                try:
+                    cx, cy, nw, nh = (float(x) for x in parts[1:5])
+                except ValueError:
+                    continue
 
             x1 = (cx - nw / 2) * img_w
             y1 = (cy - nh / 2) * img_h
