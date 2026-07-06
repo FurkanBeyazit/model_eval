@@ -597,9 +597,18 @@ def run_compare_cb(m1: str, m2: str, m3: str,
         _empty = gr.update(choices=[], value=None)
         return ("Dataset path required.",
                 [None, None, None],
-                pd.DataFrame(), "_", "_", "_", pd.DataFrame(), _empty)
+                pd.DataFrame(), "_", "_", "_", pd.DataFrame(), _empty,
+                gr.update(), gr.update(), gr.update())
 
-    specs = [(m1, "Model 1"), (m2, "Model 2"), (m3, "Model 3")]
+    def _model_label(path: str, fallback: str) -> str:
+        p = path.strip() if path else ""
+        return os.path.basename(p) if p else fallback
+
+    specs = [
+        (m1, _model_label(m1, "Model 1")),
+        (m2, _model_label(m2, "Model 2")),
+        (m3, _model_label(m3, "Model 3")),
+    ]
     models_data = []
     for mp, label in specs:
         models_data.append(
@@ -611,7 +620,8 @@ def run_compare_cb(m1: str, m2: str, m3: str,
         _empty = gr.update(choices=[], value=None)
         return ("No valid models provided.",
                 models_data,
-                pd.DataFrame(), "_", "_", "_", pd.DataFrame(), _empty)
+                pd.DataFrame(), "_", "_", "_", pd.DataFrame(), _empty,
+                gr.update(), gr.update(), gr.update())
 
     md1 = _cmp_metrics_md(models_data[0])
     md2 = _cmp_metrics_md(models_data[1])
@@ -632,8 +642,12 @@ def run_compare_cb(m1: str, m2: str, m3: str,
         f"Done — {len(valid)} model(s) | {len(all_names)} images"
         + (f" | Errors: {', '.join(errors)}" if errors else "")
     )
+    labels = [s[1] for s in specs]
     return (status, models_data, summary_df, md1, md2, md3, cdf,
-            gr.update(choices=all_names, value=all_names[0] if all_names else None))
+            gr.update(choices=all_names, value=all_names[0] if all_names else None),
+            gr.update(label=labels[0]),
+            gr.update(label=labels[1]),
+            gr.update(label=labels[2]))
 
 
 def compare_image_cb(image_name: str, models_data: list):
@@ -1114,7 +1128,8 @@ def build_demo() -> gr.Blocks:
             outputs=[compare_status, compare_state,
                      cmp_summary_out,
                      cmp_md1, cmp_md2, cmp_md3,
-                     cmp_table_out, cmp_img_dd],
+                     cmp_table_out, cmp_img_dd,
+                     cmp_img1, cmp_img2, cmp_img3],
         )
 
         # Model Comparison — image viewer
